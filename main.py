@@ -162,7 +162,6 @@ def conn():
 def db_init():
     with conn() as c:
         c.executescript(SCHEMA)
-        # миграции для уже существующих БД
         cols = {row["name"] for row in c.execute("PRAGMA table_info(provider_keys)")}
         if "disabled_reason" not in cols:
             c.execute("ALTER TABLE provider_keys ADD COLUMN disabled_reason TEXT")
@@ -204,7 +203,6 @@ class ProviderState:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def pick(self) -> Optional[KeyState]:
-        """Выбрать наименее загруженный ключ вне cooldown."""
         async with self._lock:
             now = time.monotonic()
             best, best_score = None, float("inf")
@@ -260,7 +258,6 @@ class AppState:
     http: Optional[httpx.AsyncClient] = None
 
 
-# ключи, у которых менялись метрики и которые надо записать в БД
 _dirty_keys: set = set()
 
 
@@ -302,13 +299,6 @@ def _apply_usage(key: KeyState, usage):
 
 
 def load_state(st: AppState):
-    """
-    Синхронизировать in-memory состояние с БД.
-
-    Не пересоздаём ProviderState / KeyState для уже существующих сущностей —
-    иначе сбросятся in_flight, cooldown и накопленная статистика у ключей,
-    которые прямо сейчас обслуживают запросы.
-    """
     with conn() as c:
         seen_provider_ids = set()
         for p in c.execute("SELECT * FROM providers"):
@@ -371,7 +361,6 @@ def total_in_flight(st: AppState) -> int:
 
 
 def _flush_stats(st: AppState):
-    """Записать в БД накопленные метрики по грязным ключам."""
     if not _dirty_keys:
         return
     dirty_snapshot = set(_dirty_keys)
@@ -517,7 +506,6 @@ def _extract_usage_from_json(body: bytes) -> Optional[dict]:
 
 
 def _extract_usage_from_sse_tail(tail: bytes) -> Optional[dict]:
-    """Найти последний SSE-чанк с usage в хвосте стрима (best effort)."""
     for line in reversed(tail.split(b"\n")):
         line = line.strip()
         if not line.startswith(b"data:"):
@@ -958,7 +946,7 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
     <div class="key" id="newkey">{new_key}</div>
     <div class="copy">
       <button type="button" class="btn-ghost"
-              onclick="navigator.clipboard.writeText(document.getElementById('newkey').textContent).then(()=>{this.textContent='Скопировано ✓';setTimeout(()=>this.textContent='Скопировать',1500)})">
+              onclick="var b=this;navigator.clipboard.writeText(document.getElementById('newkey').textContent).then(function(){{b.textContent='Скопировано ✓';setTimeout(function(){{b.textContent='Скопировать'}},1500)}})">
         Скопировать
       </button>
     </div>
@@ -1088,7 +1076,7 @@ async def lifespan(app: FastAPI):
                 f"shutdown: {remaining} request(s) still in flight, forcing close"
             )
 
-        _flush_stats(st)  # финальный сброс статистики
+        _flush_stats(st)
         await st.http.aclose()
         log.info("cxepy stopped")
 
@@ -1299,7 +1287,6 @@ async def chat_completions(request: Request):
     if provider.model_id:
         payload["model"] = provider.model_id
 
-    # инъекция include_usage — чтобы провайдер вернул usage в стриме
     if INJECT_STREAM_USAGE and payload.get("stream") is True:
         opts = payload.get("stream_options")
         if not isinstance(opts, dict):
@@ -1348,7 +1335,6 @@ async def chat_completions(request: Request):
             last_status, last_body = resp.status_code, err_body
 
             if resp.status_code not in RETRYABLE_STATUS and not quota:
-                # 400/403/404 (не-квота) — вина клиента, отдаём как есть
                 log.info(
                     f"proxy 4xx passthrough · prov={provider.name} key={key.id} "
                     f"status={resp.status_code} "
@@ -1367,7 +1353,6 @@ async def chat_completions(request: Request):
                 await asyncio.sleep(0.1 * (2 ** attempt))
             continue
 
-        # 2xx — отдаём клиенту (со стримингом)
         headers = {
             k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP
         }
@@ -1386,11 +1371,6 @@ async def chat_completions(request: Request):
 
 
 async def _stream_upstream(resp: httpx.Response, provider: ProviderState, key: KeyState):
-    """
-    Прокидываем чанки в клиент без буферизации.
-    Параллельно держим хвост последних 8KB, чтобы вытащить usage из SSE
-    (приходит в финальном чанке при stream_options.include_usage=true).
-    """
     tail = bytearray()
     try:
         async for chunk in resp.aiter_bytes():
@@ -1403,7 +1383,6 @@ async def _stream_upstream(resp: httpx.Response, provider: ProviderState, key: K
         try:
             usage = _extract_usage_from_sse_tail(bytes(tail))
             if usage is None:
-                # на случай не-стримингового ответа через тот же путь
                 usage = _extract_usage_from_json(bytes(tail))
             if usage:
                 _apply_usage(key, usage)
