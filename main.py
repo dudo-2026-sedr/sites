@@ -6,18 +6,17 @@ cxepy — умный OpenAI-совместимый прокси с ротаци�
     uvicorn main:app --host 0.0.0.0 --port 8080 --workers 1
 
 На Railway:
-    Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 \
+                                     --timeout-graceful-shutdown 30
     Volume: mount path /data
-    Env: DATA_DIR=/data
-
-Первый вход: /admin/login  (admin / changeme по умолчанию — меняется через env
-ADMIN_USER и ADMIN_PASSWORD).
+    Env: DATA_DIR=/data, ADMIN_PASSWORD=<не changeme>
 """
 
 import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -38,6 +37,16 @@ from fastapi.responses import (
 )
 
 # ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("cxepy")
+
+# ============================================================
 # CONFIG
 # ============================================================
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
@@ -47,6 +56,17 @@ DB_PATH = DATA_DIR / "cxepy.db"
 SESSION_TTL = 7 * 24 * 3600
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
+
+# логин rate-limit
+LOGIN_WINDOW = 900      # 15 минут
+LOGIN_MAX = 5           # 5 неудач с одного IP
+
+# retryable HTTP-статусы от upstream
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+MAX_KEY_ATTEMPTS = 3
+
+# graceful shutdown
+SHUTDOWN_GRACE_SECONDS = 25
 
 # ============================================================
 # DB
@@ -83,14 +103,17 @@ CREATE TABLE IF NOT EXISTS client_keys (
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_provider_keys_provider ON provider_keys(provider_id);
+CREATE INDEX IF NOT EXISTS idx_client_keys_provider ON client_keys(provider_id);
 """
 
 
 @contextlib.contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=10)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
+    c.execute("PRAGMA journal_mode=WAL")
     try:
         yield c
         c.commit()
@@ -128,6 +151,7 @@ class ProviderState:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def pick(self) -> Optional[KeyState]:
+        """Выбрать наименее загруженный ключ вне cooldown."""
         async with self._lock:
             now = time.monotonic()
             best, best_score = None, float("inf")
@@ -156,6 +180,7 @@ class ProviderState:
             key.cooldown_until = time.monotonic() + 5
         elif status in (401, 403):
             key.disabled = True
+            log.warning(f"provider={self.name} key={key.id} disabled (auth error)")
 
 
 @dataclass
@@ -170,24 +195,64 @@ def hash_client_key(raw: str) -> str:
 
 
 def load_state(st: AppState):
-    st.providers.clear()
-    st.client_keys.clear()
+    """
+    Синхронизировать in-memory состояние с БД.
+
+    ВАЖНО: не пересоздаём ProviderState / KeyState для уже существующих
+    сущностей — иначе сбросятся in_flight, cooldown и накопленная
+    статистика у ключей, которые прямо сейчас обслуживают запросы.
+    """
     with conn() as c:
+        # --- провайдеры ---
+        seen_provider_ids = set()
         for p in c.execute("SELECT * FROM providers"):
-            ps = ProviderState(
-                id=p["id"],
-                name=p["name"],
-                base_url=p["base_url"].rstrip("/"),
-                model_id=p["model_id"],
+            pid = p["id"]
+            seen_provider_ids.add(pid)
+            base = p["base_url"].rstrip("/")
+
+            ps = st.providers.get(pid)
+            if ps is None:
+                ps = ProviderState(
+                    id=pid, name=p["name"], base_url=base, model_id=p["model_id"]
+                )
+                st.providers[pid] = ps
+            else:
+                ps.name = p["name"]
+                ps.base_url = base
+                ps.model_id = p["model_id"]
+
+            # --- ключи провайдера: sync по id ---
+            db_keys = {
+                k["id"]: k["api_key"]
+                for k in c.execute(
+                    "SELECT id, api_key FROM provider_keys "
+                    "WHERE provider_id=? AND enabled=1",
+                    (pid,),
+                )
+            }
+            # удалить исчезнувшие из БД (или выключенные)
+            ps.keys = [k for k in ps.keys if k.id in db_keys]
+            existing_ids = {k.id for k in ps.keys}
+            # добавить только новые
+            for kid, kval in db_keys.items():
+                if kid not in existing_ids:
+                    ps.keys.append(KeyState(id=kid, value=kval))
+
+        # удалить исчезнувшие провайдеры
+        for stale_id in set(st.providers) - seen_provider_ids:
+            del st.providers[stale_id]
+
+        # --- client_keys: можно пересобрать, они без состояния ---
+        st.client_keys.clear()
+        for ck in c.execute("SELECT key_hash, provider_id, enabled FROM client_keys"):
+            st.client_keys[ck["key_hash"]] = (
+                ck["provider_id"],
+                bool(ck["enabled"]),
             )
-            for k in c.execute(
-                "SELECT * FROM provider_keys WHERE provider_id=? AND enabled=1",
-                (p["id"],),
-            ):
-                ps.keys.append(KeyState(id=k["id"], value=k["api_key"]))
-            st.providers[p["id"]] = ps
-        for ck in c.execute("SELECT * FROM client_keys"):
-            st.client_keys[ck["key_hash"]] = (ck["provider_id"], bool(ck["enabled"]))
+
+
+def total_in_flight(st: AppState) -> int:
+    return sum(k.in_flight for p in st.providers.values() for k in p.keys)
 
 
 # ============================================================
@@ -234,6 +299,44 @@ def generate_client_key() -> str:
     return "cxepy-" + "".join(secrets.choice(a) for _ in range(32))
 
 
+# --- login rate-limit ---
+_login_attempts: dict[str, list[float]] = {}
+
+
+def client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_prune(ip: str, now: float) -> list[float]:
+    attempts = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW]
+    _login_attempts[ip] = attempts
+    return attempts
+
+
+def login_rate_check(ip: str):
+    now = time.time()
+    # лёгкая периодическая очистка, чтобы dict не рос бесконечно
+    if len(_login_attempts) > 1024:
+        for k in list(_login_attempts.keys()):
+            _login_prune(k, now)
+            if not _login_attempts[k]:
+                del _login_attempts[k]
+    attempts = _login_prune(ip, now)
+    if len(attempts) >= LOGIN_MAX:
+        raise HTTPException(429, "too many login attempts, try again later")
+
+
+def login_rate_fail(ip: str):
+    _login_attempts.setdefault(ip, []).append(time.time())
+
+
+def login_rate_clear(ip: str):
+    _login_attempts.pop(ip, None)
+
+
 # ============================================================
 # STYLES + TEMPLATES
 # ============================================================
@@ -262,7 +365,6 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;opac
 a{color:inherit;text-decoration:none}
 .container{position:relative;z-index:1;max-width:1120px;margin:0 auto;padding:0 28px}
 
-/* nav */
 .nav{position:relative;z-index:2;display:flex;align-items:center;justify-content:space-between;
   padding:22px 0 20px;border-bottom:1px solid var(--border);margin-bottom:36px}
 .brand{display:flex;align-items:center;gap:11px;font-weight:600;font-size:17px;letter-spacing:-.02em}
@@ -277,14 +379,12 @@ a{color:inherit;text-decoration:none}
   border-radius:9px;transition:all .15s ease;border:1px solid transparent}
 .nav-link:hover{color:var(--text);background:var(--surface);border-color:var(--border)}
 
-/* hero */
 .hero{margin-bottom:28px}
 .hero h1{font-size:34px;font-weight:600;letter-spacing:-.03em;line-height:1.15;
   background:linear-gradient(180deg,#fff 0%,#a8a8bc 100%);
   -webkit-background-clip:text;background-clip:text;color:transparent}
 .hero p{color:var(--text-dim);font-size:14.5px;margin-top:6px}
 
-/* stat grid */
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:26px 0 34px}
 .stat{position:relative;padding:20px 20px 18px;border-radius:var(--radius);
   background:var(--surface);border:1px solid var(--border);
@@ -305,21 +405,18 @@ a{color:inherit;text-decoration:none}
 .stat.green .glow{background:var(--green)}
 .stat.amber .glow{background:var(--amber)}
 
-/* section */
 .section{margin:34px 0}
 .section-title{display:flex;align-items:baseline;justify-content:space-between;
   margin-bottom:14px}
 .section-title h2{font-size:16px;font-weight:600;letter-spacing:-.01em}
 .section-title .count{color:var(--text-mute);font-size:12.5px}
 
-/* card */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
   padding:22px 22px 20px;backdrop-filter:blur(12px);
   -webkit-backdrop-filter:blur(12px);position:relative;overflow:hidden}
 .card::before{content:'';position:absolute;top:0;left:22px;right:22px;height:1px;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent)}
 
-/* form */
 .field{margin-bottom:14px}
 .field label{display:block;font-size:12px;color:var(--text-dim);font-weight:500;
   margin-bottom:6px;letter-spacing:.01em}
@@ -333,7 +430,6 @@ a{color:inherit;text-decoration:none}
   monospace;font-size:12.5px;line-height:1.65}
 .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 
-/* buttons */
 button,.btn{font:inherit;font-size:13.5px;font-weight:500;border:none;cursor:pointer;
   padding:10px 16px;border-radius:var(--radius-sm);transition:all .15s ease;
   letter-spacing:-.005em;display:inline-flex;align-items:center;gap:7px}
@@ -349,7 +445,6 @@ button,.btn{font:inherit;font-size:13.5px;font-weight:500;border:none;cursor:poi
 .btn-icon:hover{color:var(--red);background:rgba(248,113,113,.09);border-color:rgba(248,113,113,.22)}
 .btn-icon.neutral:hover{color:var(--text);background:var(--surface-hi);border-color:var(--border)}
 
-/* table */
 .tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
   overflow:hidden;backdrop-filter:blur(12px)}
 table{width:100%;border-collapse:collapse}
@@ -361,7 +456,6 @@ tr:last-child td{border-bottom:none}
 tr:hover td{background:rgba(255,255,255,.014)}
 td.num{font-variant-numeric:tabular-nums}
 
-/* pills / badges */
 .mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;
   font-size:11.5px;font-weight:500;letter-spacing:.005em;font-family:'JetBrains Mono',monospace}
@@ -380,7 +474,6 @@ td.num{font-variant-numeric:tabular-nums}
 .provider-url{color:var(--text-mute);font-size:12px;margin-top:2px;
   font-family:'JetBrains Mono',monospace}
 
-/* flash */
 .flash{display:flex;gap:12px;align-items:flex-start;padding:16px 18px;border-radius:var(--radius);
   margin-bottom:22px;background:linear-gradient(135deg,rgba(139,92,246,.14),rgba(34,211,238,.07));
   border:1px solid rgba(139,92,246,.3);position:relative;overflow:hidden;
@@ -394,15 +487,14 @@ td.num{font-variant-numeric:tabular-nums}
 .flash .key{font-family:'JetBrains Mono',monospace;font-size:13px;background:rgba(0,0,0,.45);
   padding:10px 12px;border-radius:8px;border:1px solid var(--border);
   user-select:all;word-break:break-all;color:#c4b5fd}
+.flash .copy{margin-top:8px}
 .err-box{padding:14px 16px;border-radius:var(--radius-sm);margin-bottom:18px;
   background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.28);
   color:#fca5a5;font-size:13.5px}
 
-/* empty */
 .empty{padding:44px 24px;text-align:center;color:var(--text-mute);font-size:13.5px}
 .empty .icon{font-size:28px;margin-bottom:10px;opacity:.4}
 
-/* login */
 .login-wrap{position:relative;z-index:1;min-height:100vh;display:grid;place-items:center;
   padding:24px}
 .login-card{width:100%;max-width:400px;padding:36px 32px 30px;border-radius:20px;
@@ -418,7 +510,6 @@ td.num{font-variant-numeric:tabular-nums}
   -webkit-background-clip:text;background-clip:text;color:transparent}
 .login-card p.sub{color:var(--text-dim);font-size:13.5px;margin:-14px 0 24px}
 
-/* footer */
 .footer{margin:56px 0 32px;padding-top:22px;border-top:1px solid var(--border);
   color:var(--text-mute);font-size:12.5px;display:flex;justify-content:space-between;
   align-items:center;flex-wrap:wrap;gap:10px}
@@ -511,11 +602,12 @@ def _key_status_chip(p: ProviderState) -> str:
 
 
 def dashboard_page(st: AppState, new_key: str = "") -> str:
-    # --- агрегированные статы ---
     total_providers = len(st.providers)
     total_keys = sum(len(p.keys) for p in st.providers.values())
-    active_keys = sum(1 for p in st.providers.values() for k in p.keys if not k.disabled)
-    in_flight = sum(k.in_flight for p in st.providers.values() for k in p.keys)
+    active_keys = sum(
+        1 for p in st.providers.values() for k in p.keys if not k.disabled
+    )
+    inflight = sum(k.in_flight for p in st.providers.values() for k in p.keys)
     total_reqs = sum(k.total for p in st.providers.values() for k in p.keys)
     ok_reqs = sum(k.success for p in st.providers.values() for k in p.keys)
     rate = (ok_reqs / total_reqs * 100) if total_reqs else 100.0
@@ -534,7 +626,7 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
   </div>
   <div class="stat amber">
     <div class="label">В работе</div>
-    <div class="value">{in_flight}</div>
+    <div class="value">{inflight}</div>
     <div class="glow"></div>
   </div>
   <div class="stat green">
@@ -544,15 +636,13 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
   </div>
 </div>"""
 
-    # --- таблица провайдеров ---
     rows = []
     for p in st.providers.values():
         active = sum(1 for k in p.keys if not k.disabled)
-        inflight = sum(k.in_flight for k in p.keys)
-        total = sum(k.total for k in p.keys)
-        succ = sum(k.success for k in p.keys)
-        errs = sum(k.error_count for k in p.keys)
-        rate_p = (succ / total * 100) if total else 100.0
+        inflight_p = sum(k.in_flight for k in p.keys)
+        total_p = sum(k.total for k in p.keys)
+        succ_p = sum(k.success for k in p.keys)
+        rate_p = (succ_p / total_p * 100) if total_p else 100.0
         rows.append(f"""
         <tr>
           <td>
@@ -562,8 +652,8 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
           <td><span class="chip violet">{p.model_id}</span></td>
           <td>{_key_status_chip(p)}</td>
           <td class="num">{active} / {len(p.keys)}</td>
-          <td class="num">{inflight}</td>
-          <td class="num">{rate_p:.0f}% <span class="muted">({succ}/{total})</span></td>
+          <td class="num">{inflight_p}</td>
+          <td class="num">{rate_p:.0f}% <span class="muted">({succ_p}/{total_p})</span></td>
           <td>
             <div style="display:flex;gap:4px;justify-content:flex-end">
               <form method="post" action="/admin/providers/{p.id}/keys" style="display:inline"
@@ -605,7 +695,6 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
   </div>
 </div>"""
 
-    # --- таблица cxepy-ключей ---
     ck_rows = []
     with conn() as c:
         for ck in c.execute("SELECT * FROM client_keys ORDER BY id DESC"):
@@ -643,7 +732,6 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
   <div class="empty"><div class="icon">⚿</div>Ключи ещё не выпущены.</div>
 </div>"""
 
-    # --- flash с новым ключом ---
     flash_html = ""
     if new_key:
         flash_html = f"""
@@ -656,7 +744,13 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
   </div>
   <div class="body">
     <div class="title">Новый cxepy-ключ создан — сохрани его, больше не покажем</div>
-    <div class="key">{new_key}</div>
+    <div class="key" id="newkey">{new_key}</div>
+    <div class="copy">
+      <button type="button" class="btn-ghost"
+              onclick="navigator.clipboard.writeText(document.getElementById('newkey').textContent).then(()=>{this.textContent='Скопировано ✓';setTimeout(()=>this.textContent='Скопировать',1500)})">
+        Скопировать
+      </button>
+    </div>
   </div>
 </div>"""
 
@@ -741,6 +835,12 @@ async def lifespan(app: FastAPI):
                 (ADMIN_USER, hash_password(ADMIN_PASSWORD)),
             )
 
+    if not os.environ.get("ADMIN_PASSWORD"):
+        log.warning(
+            "default admin password in use — set ADMIN_PASSWORD env var "
+            "and delete cxepy.db before public deploy"
+        )
+
     st = AppState()
     load_state(st)
     st.http = httpx.AsyncClient(
@@ -748,10 +848,24 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
     )
     app.state.cxepy = st
+    log.info(f"cxepy started · providers={len(st.providers)} · db={DB_PATH}")
+
     try:
         yield
     finally:
+        # graceful shutdown: дождаться активных стримов
+        deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            inflight = total_in_flight(st)
+            if inflight == 0:
+                break
+            log.info(f"shutdown: waiting for {inflight} in-flight request(s)")
+            await asyncio.sleep(0.5)
+        remaining = total_in_flight(st)
+        if remaining:
+            log.warning(f"shutdown: {remaining} request(s) still in flight, forcing close")
         await st.http.aclose()
+        log.info("cxepy stopped")
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -781,12 +895,20 @@ async def login(
     username: str = Form(...),
     password: str = Form(...),
 ):
+    ip = client_ip(request)
+    login_rate_check(ip)
+
     with conn() as c:
         row = c.execute(
             "SELECT * FROM admins WHERE username=?", (username,)
         ).fetchone()
+
     if not row or not verify_password(password, row["password_hash"]):
+        login_rate_fail(ip)
+        log.warning(f"failed login attempt from {ip} (user={username!r})")
         return HTMLResponse(login_page("Неверный логин или пароль"), status_code=401)
+
+    login_rate_clear(ip)
     token = create_session(row["id"])
     resp = RedirectResponse("/admin/", status_code=303)
     resp.set_cookie(
@@ -836,11 +958,10 @@ async def add_provider(
             (name, base, model_id, time.time()),
         )
         pid = cur.lastrowid
-        for k in keys:
-            c.execute(
-                "INSERT INTO provider_keys (provider_id, api_key) VALUES (?,?)",
-                (pid, k),
-            )
+        c.executemany(
+            "INSERT INTO provider_keys (provider_id, api_key) VALUES (?,?)",
+            [(pid, k) for k in keys],
+        )
 
     raw = generate_client_key()
     with conn() as c:
@@ -851,6 +972,8 @@ async def add_provider(
         )
 
     load_state(request.app.state.cxepy)
+    log.info(f"provider added: {name} ({len(keys)} keys)")
+
     resp = RedirectResponse("/admin/", status_code=303)
     resp.set_cookie("flash_key", raw, httponly=True, samesite="lax", max_age=120)
     return resp
@@ -875,12 +998,16 @@ async def rotate_client_key(request: Request, pid: int):
 @app.post("/admin/providers/{pid}/keys")
 async def add_provider_key(request: Request, pid: int, api_key: str = Form(...)):
     require_admin(request)
+    val = api_key.strip()
+    if not val:
+        raise HTTPException(400, "empty api key")
     with conn() as c:
         c.execute(
             "INSERT INTO provider_keys (provider_id, api_key) VALUES (?,?)",
-            (pid, api_key.strip()),
+            (pid, val),
         )
     load_state(request.app.state.cxepy)
+    log.info(f"provider {pid}: added key")
     return RedirectResponse("/admin/", status_code=303)
 
 
@@ -890,6 +1017,7 @@ async def delete_provider(request: Request, pid: int):
     with conn() as c:
         c.execute("DELETE FROM providers WHERE id=?", (pid,))
     load_state(request.app.state.cxepy)
+    log.info(f"provider {pid}: deleted")
     return RedirectResponse("/admin/", status_code=303)
 
 
@@ -922,6 +1050,8 @@ def extract_bearer(request: Request) -> Optional[str]:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     st: AppState = request.app.state.cxepy
+    started = time.monotonic()
+
     raw = extract_bearer(request)
     if not raw:
         raise HTTPException(401, "missing api key")
@@ -929,6 +1059,7 @@ async def chat_completions(request: Request):
     ck = st.client_keys.get(hash_client_key(raw))
     if not ck or not ck[1]:
         raise HTTPException(401, "invalid api key")
+
     provider_id, _ = ck
     provider = st.providers.get(provider_id)
     if not provider:
@@ -951,9 +1082,12 @@ async def chat_completions(request: Request):
 
     last_status, last_body = 0, b""
 
-    for _ in range(3):
+    for attempt in range(MAX_KEY_ATTEMPTS):
         key = await provider.pick()
         if key is None:
+            # все ключи в cooldown/мёртвые
+            if last_status:
+                break
             raise HTTPException(503, "no available keys (all in cooldown)")
 
         req = st.http.build_request(
@@ -962,11 +1096,15 @@ async def chat_completions(request: Request):
             headers={**upstream_headers, "authorization": f"Bearer {key.value}"},
             content=body,
         )
+
         try:
             resp = await st.http.send(req, stream=True)
         except httpx.RequestError as e:
             provider.release(key, 0)
             last_status, last_body = 502, str(e).encode()
+            log.warning(f"upstream network error: {e}")
+            if attempt < MAX_KEY_ATTEMPTS - 1:
+                await asyncio.sleep(0.1 * (2 ** attempt))
             continue
 
         if resp.status_code >= 400:
@@ -974,16 +1112,34 @@ async def chat_completions(request: Request):
             await resp.aclose()
             provider.release(key, resp.status_code)
             last_status, last_body = resp.status_code, err_body
-            if resp.status_code != 429 and resp.status_code < 500:
+
+            if resp.status_code not in RETRYABLE_STATUS:
+                # 400/403/404 — вина клиента, отдаём как есть
+                log.info(
+                    f"proxy 4xx passthrough · prov={provider.name} key={key.id} "
+                    f"status={resp.status_code} ms={int((time.monotonic()-started)*1000)}"
+                )
                 return JSONResponse(
                     content=_safe_json(err_body),
                     status_code=resp.status_code,
                 )
+
+            log.info(
+                f"proxy retry · prov={provider.name} key={key.id} "
+                f"status={resp.status_code} attempt={attempt+1}"
+            )
+            if attempt < MAX_KEY_ATTEMPTS - 1:
+                await asyncio.sleep(0.1 * (2 ** attempt))
             continue
 
+        # 2xx — отдаём клиенту (со стримингом)
         headers = {
             k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP
         }
+        log.info(
+            f"proxy ok · prov={provider.name} key={key.id} "
+            f"status={resp.status_code} ms={int((time.monotonic()-started)*1000)}"
+        )
         return StreamingResponse(
             _stream_upstream(resp, provider, key),
             status_code=resp.status_code,
