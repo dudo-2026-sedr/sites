@@ -1,6 +1,15 @@
 """
 cxepy — умный OpenAI-совместимый прокси с ротацией API-ключей.
 
+Возможности:
+  • Умная ротация: минимальный in_flight + приоритет по ошибкам
+  • Автоотключение мёртвых ключей (quota / auth)
+  • Учёт токенов per key (in/out) с персистентностью в SQLite
+  • Hard-limits per key через env (защита от слива баланса)
+  • Точный учёт в стримах через stream_options.include_usage
+  • Честный SSE-стриминг, ретраи на retryable-статусах, backoff
+  • Красивый премиум-дашборд, rate-limit на логине, graceful shutdown
+
 Запуск (локально):
     pip install -r requirements.txt
     uvicorn main:app --host 0.0.0.0 --port 8080 --workers 1
@@ -10,6 +19,12 @@ cxepy — умный OpenAI-совместимый прокси с ротаци�
                                      --timeout-graceful-shutdown 30
     Volume: mount path /data
     Env: DATA_DIR=/data, ADMIN_PASSWORD=<не changeme>
+
+Опциональные env:
+    KEY_HARD_LIMIT_REQUESTS       — выключить ключ после N запросов
+    KEY_HARD_LIMIT_TOKENS_IN      — выключить после N входных токенов
+    KEY_HARD_LIMIT_TOKENS_OUT     — выключить после N выходных токенов
+    INJECT_STREAM_USAGE=true|false (default true)
 """
 
 import asyncio
@@ -57,16 +72,35 @@ SESSION_TTL = 7 * 24 * 3600
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
-# логин rate-limit
-LOGIN_WINDOW = 900      # 15 минут
-LOGIN_MAX = 5           # 5 неудач с одного IP
+LOGIN_WINDOW = 900
+LOGIN_MAX = 5
 
-# retryable HTTP-статусы от upstream
 RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_KEY_ATTEMPTS = 3
 
-# graceful shutdown
 SHUTDOWN_GRACE_SECONDS = 25
+STATS_FLUSH_INTERVAL = 30
+
+INJECT_STREAM_USAGE = os.environ.get("INJECT_STREAM_USAGE", "true").lower() in (
+    "1", "true", "yes", "on"
+)
+
+KEY_HARD_LIMIT_REQUESTS = int(os.environ.get("KEY_HARD_LIMIT_REQUESTS", "0") or 0)
+KEY_HARD_LIMIT_TOKENS_IN = int(os.environ.get("KEY_HARD_LIMIT_TOKENS_IN", "0") or 0)
+KEY_HARD_LIMIT_TOKENS_OUT = int(os.environ.get("KEY_HARD_LIMIT_TOKENS_OUT", "0") or 0)
+
+QUOTA_PATTERNS = (
+    b"insufficient_quota",
+    b"insufficient balance",
+    b"insufficient funds",
+    b"insufficient_credit",
+    b"quota exceeded",
+    b"exceeded your current quota",
+    b"no credits",
+    b"out of credits",
+    b"billing hard limit",
+    b"credit balance is too low",
+)
 
 # ============================================================
 # DB
@@ -93,7 +127,10 @@ CREATE TABLE IF NOT EXISTS provider_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
     api_key TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1
+    enabled INTEGER NOT NULL DEFAULT 1,
+    disabled_reason TEXT,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS client_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +151,7 @@ def conn():
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
     c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     try:
         yield c
         c.commit()
@@ -124,6 +162,18 @@ def conn():
 def db_init():
     with conn() as c:
         c.executescript(SCHEMA)
+        # миграции для уже существующих БД
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(provider_keys)")}
+        if "disabled_reason" not in cols:
+            c.execute("ALTER TABLE provider_keys ADD COLUMN disabled_reason TEXT")
+        if "tokens_in" not in cols:
+            c.execute(
+                "ALTER TABLE provider_keys ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0"
+            )
+        if "tokens_out" not in cols:
+            c.execute(
+                "ALTER TABLE provider_keys ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 # ============================================================
@@ -139,6 +189,9 @@ class KeyState:
     total: int = 0
     success: int = 0
     disabled: bool = False
+    disabled_reason: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
 
 
 @dataclass
@@ -166,21 +219,38 @@ class ProviderState:
             best.in_flight += 1
             return best
 
-    def release(self, key: KeyState, status: int):
+    def release(self, key: KeyState, status: int, is_quota: bool = False):
         key.in_flight = max(0, key.in_flight - 1)
         key.total += 1
+
         if 200 <= status < 300:
             key.error_count = 0
             key.success += 1
+        elif is_quota:
+            key.error_count += 1
+            if not key.disabled:
+                key.disabled = True
+                key.disabled_reason = "quota"
+                log.warning(
+                    f"provider={self.name} key={key.id} disabled: quota exhausted"
+                )
+        elif status in (401, 403):
+            key.error_count += 1
+            if not key.disabled:
+                key.disabled = True
+                key.disabled_reason = "auth"
+                log.warning(
+                    f"provider={self.name} key={key.id} disabled: auth error"
+                )
         elif status == 429:
             key.error_count += 1
             key.cooldown_until = time.monotonic() + 30
         elif status >= 500 or status == 0:
             key.error_count += 1
             key.cooldown_until = time.monotonic() + 5
-        elif status in (401, 403):
-            key.disabled = True
-            log.warning(f"provider={self.name} key={key.id} disabled (auth error)")
+
+        _dirty_keys.add(key.id)
+        _apply_hard_limits(key)
 
 
 @dataclass
@@ -190,20 +260,56 @@ class AppState:
     http: Optional[httpx.AsyncClient] = None
 
 
+# ключи, у которых менялись метрики и которые надо записать в БД
+_dirty_keys: set = set()
+
+
 def hash_client_key(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _apply_hard_limits(key: KeyState):
+    if key.disabled:
+        return
+    if KEY_HARD_LIMIT_REQUESTS and key.total >= KEY_HARD_LIMIT_REQUESTS:
+        key.disabled = True
+        key.disabled_reason = "hard_limit"
+        log.warning(f"key={key.id} disabled: hard limit (requests)")
+    elif KEY_HARD_LIMIT_TOKENS_IN and key.tokens_in >= KEY_HARD_LIMIT_TOKENS_IN:
+        key.disabled = True
+        key.disabled_reason = "hard_limit"
+        log.warning(f"key={key.id} disabled: hard limit (tokens_in)")
+    elif KEY_HARD_LIMIT_TOKENS_OUT and key.tokens_out >= KEY_HARD_LIMIT_TOKENS_OUT:
+        key.disabled = True
+        key.disabled_reason = "hard_limit"
+        log.warning(f"key={key.id} disabled: hard limit (tokens_out)")
+
+
+def _apply_usage(key: KeyState, usage):
+    if not isinstance(usage, dict):
+        return
+    ti = usage.get("prompt_tokens") or 0
+    to = usage.get("completion_tokens") or 0
+    if not isinstance(ti, int):
+        ti = 0
+    if not isinstance(to, int):
+        to = 0
+    if ti or to:
+        key.tokens_in += ti
+        key.tokens_out += to
+        _dirty_keys.add(key.id)
+        _apply_hard_limits(key)
 
 
 def load_state(st: AppState):
     """
     Синхронизировать in-memory состояние с БД.
 
-    ВАЖНО: не пересоздаём ProviderState / KeyState для уже существующих
-    сущностей — иначе сбросятся in_flight, cooldown и накопленная
-    статистика у ключей, которые прямо сейчас обслуживают запросы.
+    Не пересоздаём ProviderState / KeyState для уже существующих сущностей —
+    иначе сбросятся in_flight, cooldown и накопленная статистика у ключей,
+    которые прямо сейчас обслуживают запросы.
     """
     with conn() as c:
-        # --- провайдеры ---
         seen_provider_ids = set()
         for p in c.execute("SELECT * FROM providers"):
             pid = p["id"]
@@ -221,28 +327,37 @@ def load_state(st: AppState):
                 ps.base_url = base
                 ps.model_id = p["model_id"]
 
-            # --- ключи провайдера: sync по id ---
             db_keys = {
-                k["id"]: k["api_key"]
+                k["id"]: (
+                    k["api_key"],
+                    bool(k["enabled"]),
+                    k["disabled_reason"] or "",
+                    k["tokens_in"] or 0,
+                    k["tokens_out"] or 0,
+                )
                 for k in c.execute(
-                    "SELECT id, api_key FROM provider_keys "
-                    "WHERE provider_id=? AND enabled=1",
+                    "SELECT id, api_key, enabled, disabled_reason, "
+                    "tokens_in, tokens_out "
+                    "FROM provider_keys WHERE provider_id=?",
                     (pid,),
                 )
             }
-            # удалить исчезнувшие из БД (или выключенные)
             ps.keys = [k for k in ps.keys if k.id in db_keys]
             existing_ids = {k.id for k in ps.keys}
-            # добавить только новые
-            for kid, kval in db_keys.items():
-                if kid not in existing_ids:
-                    ps.keys.append(KeyState(id=kid, value=kval))
+            for kid, (kval, enabled, reason, ti, to) in db_keys.items():
+                if kid in existing_ids:
+                    continue
+                ks = KeyState(id=kid, value=kval)
+                if not enabled:
+                    ks.disabled = True
+                    ks.disabled_reason = reason
+                ks.tokens_in = ti
+                ks.tokens_out = to
+                ps.keys.append(ks)
 
-        # удалить исчезнувшие провайдеры
         for stale_id in set(st.providers) - seen_provider_ids:
             del st.providers[stale_id]
 
-        # --- client_keys: можно пересобрать, они без состояния ---
         st.client_keys.clear()
         for ck in c.execute("SELECT key_hash, provider_id, enabled FROM client_keys"):
             st.client_keys[ck["key_hash"]] = (
@@ -253,6 +368,49 @@ def load_state(st: AppState):
 
 def total_in_flight(st: AppState) -> int:
     return sum(k.in_flight for p in st.providers.values() for k in p.keys)
+
+
+def _flush_stats(st: AppState):
+    """Записать в БД накопленные метрики по грязным ключам."""
+    if not _dirty_keys:
+        return
+    dirty_snapshot = set(_dirty_keys)
+
+    updates = []
+    for p in st.providers.values():
+        for k in p.keys:
+            if k.id in dirty_snapshot:
+                updates.append((
+                    0 if k.disabled else 1,
+                    k.disabled_reason or None,
+                    k.tokens_in,
+                    k.tokens_out,
+                    k.id,
+                ))
+
+    if not updates:
+        _dirty_keys.difference_update(dirty_snapshot)
+        return
+
+    try:
+        with conn() as c:
+            c.executemany(
+                "UPDATE provider_keys SET enabled=?, disabled_reason=?, "
+                "tokens_in=?, tokens_out=? WHERE id=?",
+                updates,
+            )
+        _dirty_keys.difference_update(dirty_snapshot)
+    except Exception as e:
+        log.error(f"stats flush failed: {e}")
+
+
+async def _stats_flusher(st: AppState):
+    try:
+        while True:
+            await asyncio.sleep(STATS_FLUSH_INTERVAL)
+            _flush_stats(st)
+    except asyncio.CancelledError:
+        raise
 
 
 # ============================================================
@@ -299,8 +457,7 @@ def generate_client_key() -> str:
     return "cxepy-" + "".join(secrets.choice(a) for _ in range(32))
 
 
-# --- login rate-limit ---
-_login_attempts: dict[str, list[float]] = {}
+_login_attempts: dict = {}
 
 
 def client_ip(request: Request) -> str:
@@ -310,7 +467,7 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _login_prune(ip: str, now: float) -> list[float]:
+def _login_prune(ip: str, now: float) -> list:
     attempts = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW]
     _login_attempts[ip] = attempts
     return attempts
@@ -318,7 +475,6 @@ def _login_prune(ip: str, now: float) -> list[float]:
 
 def login_rate_check(ip: str):
     now = time.time()
-    # лёгкая периодическая очистка, чтобы dict не рос бесконечно
     if len(_login_attempts) > 1024:
         for k in list(_login_attempts.keys()):
             _login_prune(k, now)
@@ -335,6 +491,51 @@ def login_rate_fail(ip: str):
 
 def login_rate_clear(ip: str):
     _login_attempts.pop(ip, None)
+
+
+# ============================================================
+# UPSTREAM ERROR / USAGE HELPERS
+# ============================================================
+def _is_quota_error(status: int, body: bytes) -> bool:
+    if status == 402:
+        return True
+    if status in (403, 429) and body:
+        bl = body.lower()
+        for pat in QUOTA_PATTERNS:
+            if pat in bl:
+                return True
+    return False
+
+
+def _extract_usage_from_json(body: bytes) -> Optional[dict]:
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    u = data.get("usage") if isinstance(data, dict) else None
+    return u if isinstance(u, dict) else None
+
+
+def _extract_usage_from_sse_tail(tail: bytes) -> Optional[dict]:
+    """Найти последний SSE-чанк с usage в хвосте стрима (best effort)."""
+    for line in reversed(tail.split(b"\n")):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        if b'"usage"' not in payload:
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            u = data.get("usage")
+            if isinstance(u, dict):
+                return u
+    return None
 
 
 # ============================================================
@@ -588,15 +789,15 @@ def login_page(err: str = "") -> str:
 
 
 def _key_status_chip(p: ProviderState) -> str:
-    active = sum(1 for k in p.keys if not k.disabled)
     total = len(p.keys)
+    active = sum(1 for k in p.keys if not k.disabled)
     if total == 0 or active == 0:
         return '<span class="chip red"><span class="dot-led red"></span>мёртв</span>'
     now = time.monotonic()
     cooling = sum(1 for k in p.keys if not k.disabled and k.cooldown_until > now)
-    if cooling == total:
+    if cooling == active:
         return '<span class="chip amber"><span class="dot-led amber"></span>cooldown</span>'
-    if cooling > 0:
+    if cooling > 0 or active < total:
         return '<span class="chip amber"><span class="dot-led amber"></span>частично</span>'
     return '<span class="chip green"><span class="dot-led green"></span>готов</span>'
 
@@ -639,18 +840,28 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
     rows = []
     for p in st.providers.values():
         active = sum(1 for k in p.keys if not k.disabled)
+        disabled_n = sum(1 for k in p.keys if k.disabled)
         inflight_p = sum(k.in_flight for k in p.keys)
         total_p = sum(k.total for k in p.keys)
         succ_p = sum(k.success for k in p.keys)
         rate_p = (succ_p / total_p * 100) if total_p else 100.0
+        ti = sum(k.tokens_in for k in p.keys)
+        to = sum(k.tokens_out for k in p.keys)
+        tokens_note = f"{ti:,} in / {to:,} out".replace(",", " ")
+        disabled_note = (
+            f' <span class="chip red" style="font-size:10.5px">{disabled_n} off</span>'
+            if disabled_n else ""
+        )
         rows.append(f"""
         <tr>
           <td>
             <div class="provider-name">{p.name}</div>
             <div class="provider-url">{p.base_url}</div>
+            <div class="muted" style="margin-top:4px;font-family:'JetBrains Mono',monospace;
+                 font-size:11px">{tokens_note} tok</div>
           </td>
           <td><span class="chip violet">{p.model_id}</span></td>
-          <td>{_key_status_chip(p)}</td>
+          <td>{_key_status_chip(p)}{disabled_note}</td>
           <td class="num">{active} / {len(p.keys)}</td>
           <td class="num">{inflight_p}</td>
           <td class="num">{rate_p:.0f}% <span class="muted">({succ_p}/{total_p})</span></td>
@@ -848,12 +1059,22 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
     )
     app.state.cxepy = st
-    log.info(f"cxepy started · providers={len(st.providers)} · db={DB_PATH}")
 
+    flusher = asyncio.create_task(_stats_flusher(st))
+
+    log.info(
+        f"cxepy started · providers={len(st.providers)} · db={DB_PATH} · "
+        f"stream_usage={'on' if INJECT_STREAM_USAGE else 'off'}"
+    )
     try:
         yield
     finally:
-        # graceful shutdown: дождаться активных стримов
+        flusher.cancel()
+        try:
+            await flusher
+        except asyncio.CancelledError:
+            pass
+
         deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
         while time.monotonic() < deadline:
             inflight = total_in_flight(st)
@@ -863,7 +1084,11 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(0.5)
         remaining = total_in_flight(st)
         if remaining:
-            log.warning(f"shutdown: {remaining} request(s) still in flight, forcing close")
+            log.warning(
+                f"shutdown: {remaining} request(s) still in flight, forcing close"
+            )
+
+        _flush_stats(st)  # финальный сброс статистики
         await st.http.aclose()
         log.info("cxepy stopped")
 
@@ -1073,6 +1298,15 @@ async def chat_completions(request: Request):
 
     if provider.model_id:
         payload["model"] = provider.model_id
+
+    # инъекция include_usage — чтобы провайдер вернул usage в стриме
+    if INJECT_STREAM_USAGE and payload.get("stream") is True:
+        opts = payload.get("stream_options")
+        if not isinstance(opts, dict):
+            opts = {}
+        opts.setdefault("include_usage", True)
+        payload["stream_options"] = opts
+
     body = json.dumps(payload).encode()
 
     upstream_headers = {
@@ -1085,7 +1319,6 @@ async def chat_completions(request: Request):
     for attempt in range(MAX_KEY_ATTEMPTS):
         key = await provider.pick()
         if key is None:
-            # все ключи в cooldown/мёртвые
             if last_status:
                 break
             raise HTTPException(503, "no available keys (all in cooldown)")
@@ -1110,14 +1343,16 @@ async def chat_completions(request: Request):
         if resp.status_code >= 400:
             err_body = await resp.aread()
             await resp.aclose()
-            provider.release(key, resp.status_code)
+            quota = _is_quota_error(resp.status_code, err_body)
+            provider.release(key, resp.status_code, is_quota=quota)
             last_status, last_body = resp.status_code, err_body
 
-            if resp.status_code not in RETRYABLE_STATUS:
-                # 400/403/404 — вина клиента, отдаём как есть
+            if resp.status_code not in RETRYABLE_STATUS and not quota:
+                # 400/403/404 (не-квота) — вина клиента, отдаём как есть
                 log.info(
                     f"proxy 4xx passthrough · prov={provider.name} key={key.id} "
-                    f"status={resp.status_code} ms={int((time.monotonic()-started)*1000)}"
+                    f"status={resp.status_code} "
+                    f"ms={int((time.monotonic()-started)*1000)}"
                 )
                 return JSONResponse(
                     content=_safe_json(err_body),
@@ -1126,7 +1361,7 @@ async def chat_completions(request: Request):
 
             log.info(
                 f"proxy retry · prov={provider.name} key={key.id} "
-                f"status={resp.status_code} attempt={attempt+1}"
+                f"status={resp.status_code} quota={quota} attempt={attempt+1}"
             )
             if attempt < MAX_KEY_ATTEMPTS - 1:
                 await asyncio.sleep(0.1 * (2 ** attempt))
@@ -1151,11 +1386,29 @@ async def chat_completions(request: Request):
 
 
 async def _stream_upstream(resp: httpx.Response, provider: ProviderState, key: KeyState):
+    """
+    Прокидываем чанки в клиент без буферизации.
+    Параллельно держим хвост последних 8KB, чтобы вытащить usage из SSE
+    (приходит в финальном чанке при stream_options.include_usage=true).
+    """
+    tail = bytearray()
     try:
         async for chunk in resp.aiter_bytes():
             yield chunk
+            tail.extend(chunk)
+            if len(tail) > 8192:
+                del tail[:-8192]
     finally:
         await resp.aclose()
+        try:
+            usage = _extract_usage_from_sse_tail(bytes(tail))
+            if usage is None:
+                # на случай не-стримингового ответа через тот же путь
+                usage = _extract_usage_from_json(bytes(tail))
+            if usage:
+                _apply_usage(key, usage)
+        except Exception as e:
+            log.error(f"usage extraction failed: {e}")
         provider.release(key, resp.status_code)
 
 
