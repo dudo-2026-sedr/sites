@@ -92,7 +92,6 @@ INJECT_STREAM_USAGE = os.environ.get("INJECT_STREAM_USAGE", "true").lower() in (
     "1", "true", "yes", "on"
 )
 
-# --- журнал запросов (ring buffer) ---
 LOG_BUFFER_SIZE = 500
 
 QUOTA_PATTERNS = (
@@ -108,8 +107,7 @@ QUOTA_PATTERNS = (
     b"credit balance is too low",
 )
 
-# --- загрузка файлов ---
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_FILE_SIZE = 20 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {
     "image/png", "image/jpeg", "image/gif",
     "image/webp", "image/bmp", "image/svg+xml"
@@ -210,10 +208,8 @@ class KeyState:
     disabled_reason: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
-    # --- RPM/TPM трекер ---
     rpm_window: deque = field(default_factory=deque)
-    tpm_window: deque = field(default_factory=deque)   # (ts, tokens)
-    # --- лимиты ---
+    tpm_window: deque = field(default_factory=deque)
     rpm_limit: int = 0
     tpm_limit: int = 0
     request_limit: int = 0
@@ -233,7 +229,7 @@ class ProviderState:
         cutoff = now - 60.0
         while key.rpm_window and key.rpm_window[0] < cutoff:
             key.rpm_window.popleft()
-        while key.tpm_window and key.tpm_window[0] < cutoff:
+        while key.tpm_window and key.tpm_window[0][0] < cutoff:
             key.tpm_window.popleft()
 
     def rpm_usage(self, key: KeyState, now: float) -> float:
@@ -625,7 +621,7 @@ def extract_text_from_file(content: bytes, mime: str, filename: str) -> str:
 
 
 # ============================================================
-# STYLES (v3 — premium, deep, interactive)
+# STYLES
 # ============================================================
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
@@ -662,7 +658,6 @@ a{color:inherit;text-decoration:none}
 .container-narrow{max-width:960px}
 .container-fluid{max-width:100%;padding:0 22px}
 
-/* nav */
 .nav{position:relative;z-index:5;display:flex;align-items:center;
   justify-content:space-between;padding:20px 0 18px;
   border-bottom:1px solid var(--border);margin-bottom:34px}
@@ -683,7 +678,6 @@ a{color:inherit;text-decoration:none}
 .nav-link.active{color:var(--text);background:var(--surface-hi);
   border-color:var(--border-hi)}
 
-/* hero */
 .hero{margin-bottom:30px;display:flex;align-items:flex-end;
   justify-content:space-between;flex-wrap:wrap;gap:16px}
 .hero h1{font-size:36px;font-weight:600;letter-spacing:-.035em;
@@ -699,7 +693,6 @@ a{color:inherit;text-decoration:none}
   animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 
-/* stat grid */
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;
   margin:28px 0 38px}
 .stat{position:relative;padding:22px 22px 20px;border-radius:var(--radius);
@@ -735,7 +728,6 @@ a{color:inherit;text-decoration:none}
 .stat.amber .glow{background:var(--amber)}
 .stat.pink .glow{background:var(--pink)}
 
-/* section */
 .section{margin:38px 0}
 .section-title{display:flex;align-items:baseline;
   justify-content:space-between;margin-bottom:16px;gap:14px}
@@ -743,7 +735,6 @@ a{color:inherit;text-decoration:none}
 .section-title .count{color:var(--text-mute);font-size:12.5px;
   font-family:'JetBrains Mono',monospace}
 
-/* card */
 .card{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);padding:24px 24px 22px;
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
@@ -753,7 +744,6 @@ a{color:inherit;text-decoration:none}
   height:1px;
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.14),transparent)}
 
-/* form */
 .field{margin-bottom:15px}
 .field label{display:block;font-size:12px;color:var(--text-dim);
   font-weight:500;margin-bottom:7px;letter-spacing:.01em}
@@ -772,7 +762,6 @@ a{color:inherit;text-decoration:none}
 .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px}
 .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 
-/* buttons */
 button,.btn{font:inherit;font-size:13.5px;font-weight:500;border:none;
   cursor:pointer;padding:11px 17px;border-radius:var(--radius-sm);
   transition:all .16s ease;letter-spacing:-.005em;
@@ -799,7 +788,6 @@ button,.btn{font:inherit;font-size:13.5px;font-weight:500;border:none;
   border-color:var(--border)}
 .btn-sm{padding:7px 12px;font-size:12.5px}
 
-/* table */
 .tbl-wrap{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);overflow:hidden;
   backdrop-filter:blur(14px)}
@@ -814,7 +802,6 @@ tr:hover td{background:rgba(255,255,255,.016)}
 td.num{font-variant-numeric:tabular-nums;
   font-family:'JetBrains Mono',monospace}
 
-/* pills / badges */
 .mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;
   border-radius:999px;font-size:11.5px;font-weight:500;
@@ -842,7 +829,6 @@ td.num{font-variant-numeric:tabular-nums;
 .provider-url{color:var(--text-mute);font-size:11.5px;margin-top:3px;
   font-family:'JetBrains Mono',monospace}
 
-/* progress bar */
 .pbar{position:relative;height:6px;border-radius:3px;
   background:rgba(255,255,255,.06);overflow:hidden;margin-top:6px}
 .pbar .fill{height:100%;border-radius:3px;
@@ -853,7 +839,6 @@ td.num{font-variant-numeric:tabular-nums;
 .pbar .text{position:absolute;right:0;top:-20px;font-size:10.5px;
   color:var(--text-mute);font-family:'JetBrains Mono',monospace}
 
-/* flash */
 .flash{display:flex;gap:14px;align-items:flex-start;padding:18px 20px;
   border-radius:var(--radius);margin-bottom:24px;
   background:linear-gradient(135deg,rgba(168,85,247,.16),rgba(34,211,238,.08));
@@ -881,7 +866,6 @@ td.num{font-variant-numeric:tabular-nums;
   font-size:13.5px}
 .empty .icon{font-size:30px;margin-bottom:12px;opacity:.4}
 
-/* login */
 .login-wrap{position:relative;z-index:1;min-height:100vh;
   display:grid;place-items:center;padding:24px}
 .login-card{width:100%;max-width:420px;padding:40px 34px 32px;
@@ -900,7 +884,6 @@ td.num{font-variant-numeric:tabular-nums;
 .login-card p.sub{color:var(--text-dim);font-size:13.5px;
   margin:-16px 0 26px}
 
-/* footer */
 .footer{margin:60px 0 34px;padding-top:24px;
   border-top:1px solid var(--border);color:var(--text-mute);
   font-size:12.5px;display:flex;justify-content:space-between;
@@ -909,7 +892,6 @@ td.num{font-variant-numeric:tabular-nums;
   background:var(--surface-hi);padding:4px 9px;border-radius:7px;
   border:1px solid var(--border);font-size:11.5px;color:var(--text-dim)}
 
-/* playground */
 .playground{position:relative;z-index:1;max-width:960px;margin:0 auto;
   padding:0 32px}
 .chat-window{background:var(--surface);border:1px solid var(--border);
@@ -964,7 +946,6 @@ td.num{font-variant-numeric:tabular-nums;
   vertical-align:middle;border-radius:2px}
 @keyframes blink{50%{opacity:0}}
 
-/* keys page */
 .kv-row{display:flex;align-items:center;gap:10px;
   padding:14px 16px;border-bottom:1px solid var(--border);
   transition:background .15s ease}
@@ -984,7 +965,6 @@ td.num{font-variant-numeric:tabular-nums;
 .kv-row .kv-stats{font-family:'JetBrains Mono',monospace;
   font-size:11.5px;color:var(--text-mute);min-width:130px}
 
-/* logs */
 .log-tbl td{font-family:'JetBrains Mono',monospace;font-size:12px;
   padding:11px 14px}
 .log-status{font-weight:600}
@@ -992,7 +972,6 @@ td.num{font-variant-numeric:tabular-nums;
 .log-status.retry{color:var(--amber)}
 .log-status.err{color:var(--red)}
 
-/* responsive */
 @media (max-width:900px){
   .stats{grid-template-columns:repeat(2,1fr)}
   .grid-3{grid-template-columns:1fr}
@@ -1088,7 +1067,6 @@ def _key_status_chip(p: ProviderState) -> str:
 
 
 def _provider_rpm_stats(p: ProviderState) -> tuple:
-    """Суммарный текущий и лимитный RPM/TPM провайдера."""
     now = time.monotonic()
     total_rpm_now = 0
     total_rpm_max = 0
@@ -1169,7 +1147,6 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
 
         rpm_now, rpm_max, tpm_now, tpm_max = _provider_rpm_stats(p)
         rpm_pct = (rpm_now / rpm_max * 100) if rpm_max else 0
-        tpm_pct = (tpm_now / tpm_max * 100) if tpm_max else 0
 
         rpm_cls = "pbar"
         if rpm_pct > 90:
@@ -1393,7 +1370,6 @@ evt.onerror = () => {{
 
 
 def keys_page(p: ProviderState) -> str:
-    """Страница управления ключами провайдера с инлайн-редактором лимитов."""
     now = time.monotonic()
     rows = []
     for k in p.keys:
@@ -2001,7 +1977,6 @@ async def delete_key(request: Request, kid: int):
     with conn() as c:
         c.execute("DELETE FROM provider_keys WHERE id=?", (kid,))
     load_state(request.app.state.cxepy)
-    # Возвращаемся назад
     ref = request.headers.get("referer", "/admin/")
     return RedirectResponse(ref, status_code=303)
 
@@ -2137,7 +2112,6 @@ async def playground_chat(request: Request):
     except Exception:
         raise HTTPException(400, "invalid messages json")
 
-    # --- обработка файлов ---
     uploads = form.getlist("files")
     file_parts = []
     for f in uploads:
