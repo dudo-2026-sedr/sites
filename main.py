@@ -2,13 +2,15 @@
 cxepy — умный OpenAI-совместимый прокси с ротацией API-ключей.
 
 Возможности:
-  • Умная ротация: минимальный in_flight + приоритет по ошибкам
-  • Автоотключение мёртвых ключей (quota / auth)
-  • Учёт токенов per key (in/out) с персистентностью в SQLite
-  • Hard-limits per key через env (защита от слива баланса)
-  • Точный учёт в стримах через stream_options.include_usage
-  • Честный SSE-стриминг, ретраи на retryable-статусах, backoff
-  • Красивый премиум-дашборд, rate-limit на логине, graceful shutdown
+  • Адаптивный RPM/TPM-шардинг: предотвращает 429 до их появления
+  • Управление всеми лимитами (RPM, TPM, requests, tokens) из дашборда
+  • Автоотключение мёртвых ключей (quota / auth / hard-limit)
+  • Учёт токенов per key с персистентностью в SQLite
+  • Playground: чат, файлы, фото, остановка запросов, параметры
+  • Real-time обновление дашборда через SSE
+  • Логи запросов с фильтрами
+  • Премиум-дизайн: графики, прогресс-бары, слои, неоморфизм
+  • Честный SSE-стриминг, ретраи, backoff, graceful shutdown
 
 Запуск (локально):
     pip install -r requirements.txt
@@ -19,23 +21,28 @@ cxepy — умный OpenAI-совместимый прокси с ротаци�
                                      --timeout-graceful-shutdown 30
     Volume: mount path /data
     Env: DATA_DIR=/data, ADMIN_PASSWORD=<не changeme>
-
-Опциональные env:
-    KEY_HARD_LIMIT_REQUESTS       — выключить ключ после N запросов
-    KEY_HARD_LIMIT_TOKENS_IN      — выключить после N входных токенов
-    KEY_HARD_LIMIT_TOKENS_OUT     — выключить после N выходных токенов
-    INJECT_STREAM_USAGE=true|false (default true)
 """
 
+# --- uvloop должен быть установлен ДО импорта uvicorn/asyncio ---
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
+
 import asyncio
+import base64
 import contextlib
 import hashlib
+import io
 import json
 import logging
+import mimetypes
 import os
 import secrets
 import sqlite3
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +50,7 @@ from typing import Optional
 
 import bcrypt
 import httpx
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -85,9 +92,8 @@ INJECT_STREAM_USAGE = os.environ.get("INJECT_STREAM_USAGE", "true").lower() in (
     "1", "true", "yes", "on"
 )
 
-KEY_HARD_LIMIT_REQUESTS = int(os.environ.get("KEY_HARD_LIMIT_REQUESTS", "0") or 0)
-KEY_HARD_LIMIT_TOKENS_IN = int(os.environ.get("KEY_HARD_LIMIT_TOKENS_IN", "0") or 0)
-KEY_HARD_LIMIT_TOKENS_OUT = int(os.environ.get("KEY_HARD_LIMIT_TOKENS_OUT", "0") or 0)
+# --- журнал запросов (ring buffer) ---
+LOG_BUFFER_SIZE = 500
 
 QUOTA_PATTERNS = (
     b"insufficient_quota",
@@ -101,6 +107,13 @@ QUOTA_PATTERNS = (
     b"billing hard limit",
     b"credit balance is too low",
 )
+
+# --- загрузка файлов ---
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+ALLOWED_IMAGE_TYPES = {
+    "image/png", "image/jpeg", "image/gif",
+    "image/webp", "image/bmp", "image/svg+xml"
+}
 
 # ============================================================
 # DB
@@ -130,7 +143,11 @@ CREATE TABLE IF NOT EXISTS provider_keys (
     enabled INTEGER NOT NULL DEFAULT 1,
     disabled_reason TEXT,
     tokens_in INTEGER NOT NULL DEFAULT 0,
-    tokens_out INTEGER NOT NULL DEFAULT 0
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    rpm_limit INTEGER NOT NULL DEFAULT 0,
+    tpm_limit INTEGER NOT NULL DEFAULT 0,
+    request_limit INTEGER NOT NULL DEFAULT 0,
+    token_limit INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS client_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,16 +180,18 @@ def db_init():
     with conn() as c:
         c.executescript(SCHEMA)
         cols = {row["name"] for row in c.execute("PRAGMA table_info(provider_keys)")}
-        if "disabled_reason" not in cols:
-            c.execute("ALTER TABLE provider_keys ADD COLUMN disabled_reason TEXT")
-        if "tokens_in" not in cols:
-            c.execute(
-                "ALTER TABLE provider_keys ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0"
-            )
-        if "tokens_out" not in cols:
-            c.execute(
-                "ALTER TABLE provider_keys ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0"
-            )
+        migrations = {
+            "disabled_reason": "TEXT",
+            "tokens_in": "INTEGER NOT NULL DEFAULT 0",
+            "tokens_out": "INTEGER NOT NULL DEFAULT 0",
+            "rpm_limit": "INTEGER NOT NULL DEFAULT 0",
+            "tpm_limit": "INTEGER NOT NULL DEFAULT 0",
+            "request_limit": "INTEGER NOT NULL DEFAULT 0",
+            "token_limit": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for col, typ in migrations.items():
+            if col not in cols:
+                c.execute(f"ALTER TABLE provider_keys ADD COLUMN {col} {typ}")
 
 
 # ============================================================
@@ -191,6 +210,14 @@ class KeyState:
     disabled_reason: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    # --- RPM/TPM трекер ---
+    rpm_window: deque = field(default_factory=deque)
+    tpm_window: deque = field(default_factory=deque)   # (ts, tokens)
+    # --- лимиты ---
+    rpm_limit: int = 0
+    tpm_limit: int = 0
+    request_limit: int = 0
+    token_limit: int = 0
 
 
 @dataclass
@@ -202,19 +229,65 @@ class ProviderState:
     keys: list = field(default_factory=list)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    def _prune_windows(self, key: KeyState, now: float):
+        cutoff = now - 60.0
+        while key.rpm_window and key.rpm_window[0] < cutoff:
+            key.rpm_window.popleft()
+        while key.tpm_window and key.tpm_window[0] < cutoff:
+            key.tpm_window.popleft()
+
+    def rpm_usage(self, key: KeyState, now: float) -> float:
+        if key.rpm_limit <= 0:
+            return 0.0
+        self._prune_windows(key, now)
+        return len(key.rpm_window) / key.rpm_limit
+
+    def tpm_usage(self, key: KeyState, now: float) -> float:
+        if key.tpm_limit <= 0:
+            return 0.0
+        self._prune_windows(key, now)
+        total = sum(t for _, t in key.tpm_window)
+        return total / key.tpm_limit
+
     async def pick(self) -> Optional[KeyState]:
+        """Адаптивный RPM/TPM-шардинг с предотвращением 429."""
         async with self._lock:
             now = time.monotonic()
             best, best_score = None, float("inf")
             for k in self.keys:
                 if k.disabled or k.cooldown_until > now:
                     continue
-                score = k.in_flight * 1000 + k.error_count * 100
+                self._prune_windows(k, now)
+
+                rpm_load = (len(k.rpm_window) / k.rpm_limit) if k.rpm_limit > 0 else 0.0
+                tpm_load = (
+                    (sum(t for _, t in k.tpm_window) / k.tpm_limit)
+                    if k.tpm_limit > 0 else 0.0
+                )
+
+                rpm_penalty = 0.0
+                if rpm_load > 0.8:
+                    rpm_penalty = (rpm_load - 0.8) * 1000
+                tpm_penalty = 0.0
+                if tpm_load > 0.8:
+                    tpm_penalty = (tpm_load - 0.8) * 1000
+
+                score = (
+                    k.in_flight * 1000
+                    + rpm_load * 500
+                    + tpm_load * 500
+                    + k.error_count * 100
+                    + rpm_penalty
+                    + tpm_penalty
+                )
                 if score < best_score:
                     best, best_score = k, score
+
             if best is None:
                 return None
+
             best.in_flight += 1
+            best.rpm_window.append(now)
             return best
 
     def release(self, key: KeyState, status: int, is_quota: bool = False):
@@ -256,9 +329,11 @@ class AppState:
     providers: dict = field(default_factory=dict)
     client_keys: dict = field(default_factory=dict)
     http: Optional[httpx.AsyncClient] = None
+    log_buffer: deque = field(default_factory=lambda: deque(maxlen=LOG_BUFFER_SIZE))
 
 
 _dirty_keys: set = set()
+_log_seq: int = 0
 
 
 def hash_client_key(raw: str) -> str:
@@ -268,18 +343,14 @@ def hash_client_key(raw: str) -> str:
 def _apply_hard_limits(key: KeyState):
     if key.disabled:
         return
-    if KEY_HARD_LIMIT_REQUESTS and key.total >= KEY_HARD_LIMIT_REQUESTS:
+    if key.request_limit and key.total >= key.request_limit:
         key.disabled = True
         key.disabled_reason = "hard_limit"
         log.warning(f"key={key.id} disabled: hard limit (requests)")
-    elif KEY_HARD_LIMIT_TOKENS_IN and key.tokens_in >= KEY_HARD_LIMIT_TOKENS_IN:
+    elif key.token_limit and (key.tokens_in + key.tokens_out) >= key.token_limit:
         key.disabled = True
         key.disabled_reason = "hard_limit"
-        log.warning(f"key={key.id} disabled: hard limit (tokens_in)")
-    elif KEY_HARD_LIMIT_TOKENS_OUT and key.tokens_out >= KEY_HARD_LIMIT_TOKENS_OUT:
-        key.disabled = True
-        key.disabled_reason = "hard_limit"
-        log.warning(f"key={key.id} disabled: hard limit (tokens_out)")
+        log.warning(f"key={key.id} disabled: hard limit (tokens)")
 
 
 def _apply_usage(key: KeyState, usage):
@@ -294,11 +365,13 @@ def _apply_usage(key: KeyState, usage):
     if ti or to:
         key.tokens_in += ti
         key.tokens_out += to
+        key.tpm_window.append((time.monotonic(), ti + to))
         _dirty_keys.add(key.id)
         _apply_hard_limits(key)
 
 
 def load_state(st: AppState):
+    """Синхронизировать in-memory состояние с БД (sync, не rebuild)."""
     with conn() as c:
         seen_provider_ids = set()
         for p in c.execute("SELECT * FROM providers"):
@@ -319,22 +392,22 @@ def load_state(st: AppState):
 
             db_keys = {
                 k["id"]: (
-                    k["api_key"],
-                    bool(k["enabled"]),
-                    k["disabled_reason"] or "",
-                    k["tokens_in"] or 0,
-                    k["tokens_out"] or 0,
+                    k["api_key"], bool(k["enabled"]), k["disabled_reason"] or "",
+                    k["tokens_in"] or 0, k["tokens_out"] or 0,
+                    k["rpm_limit"] or 0, k["tpm_limit"] or 0,
+                    k["request_limit"] or 0, k["token_limit"] or 0,
                 )
                 for k in c.execute(
                     "SELECT id, api_key, enabled, disabled_reason, "
-                    "tokens_in, tokens_out "
+                    "tokens_in, tokens_out, rpm_limit, tpm_limit, "
+                    "request_limit, token_limit "
                     "FROM provider_keys WHERE provider_id=?",
                     (pid,),
                 )
             }
             ps.keys = [k for k in ps.keys if k.id in db_keys]
             existing_ids = {k.id for k in ps.keys}
-            for kid, (kval, enabled, reason, ti, to) in db_keys.items():
+            for kid, (kval, enabled, reason, ti, to, rl, tl, req_l, tok_l) in db_keys.items():
                 if kid in existing_ids:
                     continue
                 ks = KeyState(id=kid, value=kval)
@@ -343,6 +416,10 @@ def load_state(st: AppState):
                     ks.disabled_reason = reason
                 ks.tokens_in = ti
                 ks.tokens_out = to
+                ks.rpm_limit = rl
+                ks.tpm_limit = tl
+                ks.request_limit = req_l
+                ks.token_limit = tok_l
                 ps.keys.append(ks)
 
         for stale_id in set(st.providers) - seen_provider_ids:
@@ -361,10 +438,10 @@ def total_in_flight(st: AppState) -> int:
 
 
 def _flush_stats(st: AppState):
+    """Записать в БД накопленные метрики по грязным ключам."""
     if not _dirty_keys:
         return
     dirty_snapshot = set(_dirty_keys)
-
     updates = []
     for p in st.providers.values():
         for k in p.keys:
@@ -376,11 +453,9 @@ def _flush_stats(st: AppState):
                     k.tokens_out,
                     k.id,
                 ))
-
     if not updates:
         _dirty_keys.difference_update(dirty_snapshot)
         return
-
     try:
         with conn() as c:
             c.executemany(
@@ -400,6 +475,14 @@ async def _stats_flusher(st: AppState):
             _flush_stats(st)
     except asyncio.CancelledError:
         raise
+
+
+def push_log(st: AppState, entry: dict):
+    global _log_seq
+    _log_seq += 1
+    entry["seq"] = _log_seq
+    entry["ts"] = time.time()
+    st.log_buffer.append(entry)
 
 
 # ============================================================
@@ -483,7 +566,7 @@ def login_rate_clear(ip: str):
 
 
 # ============================================================
-# UPSTREAM ERROR / USAGE HELPERS
+# UPSTREAM HELPERS
 # ============================================================
 def _is_quota_error(status: int, body: bytes) -> bool:
     if status == 402:
@@ -526,196 +609,405 @@ def _extract_usage_from_sse_tail(tail: bytes) -> Optional[dict]:
     return None
 
 
+def extract_text_from_file(content: bytes, mime: str, filename: str) -> str:
+    if mime == "application/pdf" or filename.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            return "\n".join(
+                (page.extract_text() or "") for page in reader.pages
+            )
+        except Exception as e:
+            return f"[не удалось прочитать PDF: {e}]"
+    if mime.startswith("text/") or filename.endswith((".txt", ".md", ".csv", ".json")):
+        return content.decode("utf-8", errors="replace")
+    return f"[файл {filename}, {mime}, {len(content)} байт]"
+
+
 # ============================================================
-# STYLES + TEMPLATES
+# STYLES (v3 — premium, deep, interactive)
 # ============================================================
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#07070c; --bg-1:#0c0c14; --surface:rgba(255,255,255,.028);
-  --surface-hi:rgba(255,255,255,.05); --border:rgba(255,255,255,.07);
-  --border-hi:rgba(255,255,255,.14);
-  --text:#ececf3; --text-dim:#9898a8; --text-mute:#5a5a6a;
-  --violet:#8b5cf6; --indigo:#6366f1; --cyan:#22d3ee;
-  --green:#34d399; --red:#f87171; --amber:#fbbf24;
-  --radius:14px; --radius-sm:10px;
+  --bg:#06060a; --bg-1:#0a0a12; --bg-2:#10101a;
+  --surface:rgba(255,255,255,.03); --surface-hi:rgba(255,255,255,.055);
+  --surface-elev:rgba(20,20,30,.85);
+  --border:rgba(255,255,255,.07); --border-hi:rgba(255,255,255,.14);
+  --text:#f0f0f6; --text-dim:#9a9aae; --text-mute:#5e5e72;
+  --violet:#a855f7; --violet-2:#8b5cf6; --indigo:#6366f1;
+  --cyan:#22d3ee; --pink:#ec4899; --green:#34d399;
+  --red:#f87171; --amber:#fbbf24;
+  --radius:16px; --radius-sm:11px; --radius-lg:22px;
+  --shadow-sm:0 2px 8px -2px rgba(0,0,0,.5);
+  --shadow-md:0 8px 28px -10px rgba(0,0,0,.65);
+  --shadow-lg:0 24px 70px -20px rgba(0,0,0,.75);
+  --glow-violet:0 0 30px -6px rgba(168,85,247,.55);
 }
 html,body{background:var(--bg);color:var(--text);min-height:100vh;
   font-family:'Inter',-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
-  font-feature-settings:'cv11','ss01','ss03';-webkit-font-smoothing:antialiased;
-  -moz-osx-font-smoothing:grayscale;letter-spacing:-.011em;line-height:1.5}
+  font-feature-settings:'cv11','ss01','ss03','tnum';
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  letter-spacing:-.011em;line-height:1.5}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
   background:
-    radial-gradient(ellipse 70% 55% at 15% -5%, rgba(139,92,246,.22), transparent 55%),
-    radial-gradient(ellipse 55% 45% at 90% 10%, rgba(34,211,238,.10), transparent 55%),
-    radial-gradient(ellipse 90% 70% at 50% 105%, rgba(99,102,241,.10), transparent 55%)}
-body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.35;
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .035 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>")}
+    radial-gradient(ellipse 65% 50% at 12% -8%, rgba(168,85,247,.28), transparent 58%),
+    radial-gradient(ellipse 50% 42% at 92% 8%, rgba(34,211,238,.13), transparent 58%),
+    radial-gradient(ellipse 85% 65% at 50% 108%, rgba(99,102,241,.14), transparent 58%),
+    radial-gradient(ellipse 40% 30% at 70% 60%, rgba(236,72,153,.06), transparent 60%)}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.32;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .04 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>")}
 a{color:inherit;text-decoration:none}
-.container{position:relative;z-index:1;max-width:1120px;margin:0 auto;padding:0 28px}
+.container{position:relative;z-index:1;max-width:1240px;margin:0 auto;padding:0 32px}
+.container-narrow{max-width:960px}
+.container-fluid{max-width:100%;padding:0 22px}
 
-.nav{position:relative;z-index:2;display:flex;align-items:center;justify-content:space-between;
-  padding:22px 0 20px;border-bottom:1px solid var(--border);margin-bottom:36px}
-.brand{display:flex;align-items:center;gap:11px;font-weight:600;font-size:17px;letter-spacing:-.02em}
-.brand .mark{width:28px;height:28px;border-radius:8px;position:relative;
+/* nav */
+.nav{position:relative;z-index:5;display:flex;align-items:center;
+  justify-content:space-between;padding:20px 0 18px;
+  border-bottom:1px solid var(--border);margin-bottom:34px}
+.brand{display:flex;align-items:center;gap:12px;font-weight:600;
+  font-size:17px;letter-spacing:-.025em}
+.brand .mark{width:30px;height:30px;border-radius:9px;position:relative;
   background:linear-gradient(135deg,var(--violet),var(--cyan));
-  box-shadow:0 0 24px rgba(139,92,246,.45),inset 0 1px 0 rgba(255,255,255,.35)}
-.brand .mark::after{content:'';position:absolute;inset:5px;border-radius:4px;
-  background:linear-gradient(135deg,rgba(255,255,255,.55),transparent)}
+  box-shadow:var(--glow-violet),inset 0 1px 0 rgba(255,255,255,.4)}
+.brand .mark::after{content:'';position:absolute;inset:5px;border-radius:5px;
+  background:linear-gradient(135deg,rgba(255,255,255,.6),transparent 70%)}
 .brand .dot{color:var(--text-mute);font-weight:400}
-.nav-actions{display:flex;gap:8px;align-items:center}
-.nav-link{color:var(--text-dim);font-size:13.5px;font-weight:500;padding:8px 14px;
-  border-radius:9px;transition:all .15s ease;border:1px solid transparent}
-.nav-link:hover{color:var(--text);background:var(--surface);border-color:var(--border)}
+.nav-actions{display:flex;gap:6px;align-items:center}
+.nav-link{color:var(--text-dim);font-size:13.5px;font-weight:500;
+  padding:9px 15px;border-radius:10px;transition:all .18s ease;
+  border:1px solid transparent;position:relative}
+.nav-link:hover{color:var(--text);background:var(--surface);
+  border-color:var(--border)}
+.nav-link.active{color:var(--text);background:var(--surface-hi);
+  border-color:var(--border-hi)}
 
-.hero{margin-bottom:28px}
-.hero h1{font-size:34px;font-weight:600;letter-spacing:-.03em;line-height:1.15;
-  background:linear-gradient(180deg,#fff 0%,#a8a8bc 100%);
+/* hero */
+.hero{margin-bottom:30px;display:flex;align-items:flex-end;
+  justify-content:space-between;flex-wrap:wrap;gap:16px}
+.hero h1{font-size:36px;font-weight:600;letter-spacing:-.035em;
+  line-height:1.12;
+  background:linear-gradient(160deg,#fff 0%,#b0b0c4 60%,#8080a0 100%);
   -webkit-background-clip:text;background-clip:text;color:transparent}
 .hero p{color:var(--text-dim);font-size:14.5px;margin-top:6px}
+.hero .pulse{display:inline-flex;align-items:center;gap:7px;
+  padding:7px 13px;background:var(--surface);border:1px solid var(--border);
+  border-radius:999px;font-size:12.5px;color:var(--text-dim)}
+.hero .pulse .led{width:7px;height:7px;border-radius:50%;
+  background:var(--green);box-shadow:0 0 10px var(--green);
+  animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:26px 0 34px}
-.stat{position:relative;padding:20px 20px 18px;border-radius:var(--radius);
+/* stat grid */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;
+  margin:28px 0 38px}
+.stat{position:relative;padding:22px 22px 20px;border-radius:var(--radius);
   background:var(--surface);border:1px solid var(--border);
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  overflow:hidden;transition:border-color .2s ease, transform .2s ease}
-.stat:hover{border-color:var(--border-hi);transform:translateY(-1px)}
-.stat::before{content:'';position:absolute;top:0;left:20px;right:20px;height:1px;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.14),transparent)}
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  overflow:hidden;transition:border-color .22s ease, transform .22s ease,
+    box-shadow .22s ease;cursor:default}
+.stat:hover{border-color:var(--border-hi);transform:translateY(-2px);
+  box-shadow:var(--shadow-md)}
+.stat::before{content:'';position:absolute;top:0;left:22px;right:22px;
+  height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.16),transparent)}
 .stat .label{color:var(--text-mute);font-size:11.5px;text-transform:uppercase;
-  letter-spacing:.08em;font-weight:500;margin-bottom:10px}
-.stat .value{font-size:26px;font-weight:600;letter-spacing:-.02em;
-  font-variant-numeric:tabular-nums}
-.stat .value .sub{color:var(--text-mute);font-size:15px;font-weight:500;margin-left:2px}
-.stat .glow{position:absolute;bottom:-40px;right:-40px;width:120px;height:120px;
-  border-radius:50%;filter:blur(40px);opacity:.35;pointer-events:none}
+  letter-spacing:.1em;font-weight:500;margin-bottom:12px;
+  display:flex;align-items:center;gap:7px}
+.stat .label .ico{width:14px;height:14px;opacity:.7}
+.stat .value{font-size:30px;font-weight:600;letter-spacing:-.03em;
+  font-variant-numeric:tabular-nums;
+  font-family:'JetBrains Mono',ui-monospace,monospace}
+.stat .value .sub{color:var(--text-mute);font-size:16px;font-weight:500;
+  margin-left:3px}
+.stat .delta{margin-top:8px;font-size:11.5px;color:var(--text-mute);
+  font-family:'JetBrains Mono',monospace}
+.stat .delta .up{color:var(--green)}
+.stat .delta .down{color:var(--red)}
+.stat .glow{position:absolute;bottom:-50px;right:-50px;width:150px;
+  height:150px;border-radius:50%;filter:blur(45px);opacity:.4;
+  pointer-events:none;transition:opacity .3s ease}
+.stat:hover .glow{opacity:.6}
 .stat.violet .glow{background:var(--violet)}
 .stat.cyan .glow{background:var(--cyan)}
 .stat.green .glow{background:var(--green)}
 .stat.amber .glow{background:var(--amber)}
+.stat.pink .glow{background:var(--pink)}
 
-.section{margin:34px 0}
-.section-title{display:flex;align-items:baseline;justify-content:space-between;
-  margin-bottom:14px}
-.section-title h2{font-size:16px;font-weight:600;letter-spacing:-.01em}
-.section-title .count{color:var(--text-mute);font-size:12.5px}
-
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  padding:22px 22px 20px;backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);position:relative;overflow:hidden}
-.card::before{content:'';position:absolute;top:0;left:22px;right:22px;height:1px;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent)}
-
-.field{margin-bottom:14px}
-.field label{display:block;font-size:12px;color:var(--text-dim);font-weight:500;
-  margin-bottom:6px;letter-spacing:.01em}
-.field input,.field textarea{width:100%;background:rgba(0,0,0,.35);color:var(--text);
-  border:1px solid var(--border);border-radius:var(--radius-sm);padding:11px 13px;
-  font:inherit;font-size:14px;transition:all .15s ease;outline:none}
-.field input::placeholder,.field textarea::placeholder{color:var(--text-mute)}
-.field input:focus,.field textarea:focus{border-color:rgba(139,92,246,.55);
-  background:rgba(0,0,0,.5);box-shadow:0 0 0 3px rgba(139,92,246,.14)}
-.field textarea{min-height:96px;resize:vertical;font-family:'JetBrains Mono',ui-monospace,
-  monospace;font-size:12.5px;line-height:1.65}
-.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-
-button,.btn{font:inherit;font-size:13.5px;font-weight:500;border:none;cursor:pointer;
-  padding:10px 16px;border-radius:var(--radius-sm);transition:all .15s ease;
-  letter-spacing:-.005em;display:inline-flex;align-items:center;gap:7px}
-.btn-primary{color:#fff;background:linear-gradient(135deg,var(--violet),var(--indigo));
-  box-shadow:0 1px 0 rgba(255,255,255,.15) inset, 0 6px 20px -8px rgba(139,92,246,.65)}
-.btn-primary:hover{transform:translateY(-1px);
-  box-shadow:0 1px 0 rgba(255,255,255,.15) inset, 0 10px 26px -8px rgba(139,92,246,.8)}
-.btn-primary:active{transform:translateY(0)}
-.btn-ghost{color:var(--text-dim);background:var(--surface-hi);border:1px solid var(--border)}
-.btn-ghost:hover{color:var(--text);border-color:var(--border-hi);background:rgba(255,255,255,.07)}
-.btn-icon{color:var(--text-mute);background:transparent;padding:7px 9px;border-radius:8px;
-  border:1px solid transparent}
-.btn-icon:hover{color:var(--red);background:rgba(248,113,113,.09);border-color:rgba(248,113,113,.22)}
-.btn-icon.neutral:hover{color:var(--text);background:var(--surface-hi);border-color:var(--border)}
-
-.tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  overflow:hidden;backdrop-filter:blur(12px)}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:14px 18px;font-size:13.5px;border-bottom:1px solid var(--border);
-  vertical-align:middle}
-th{font-weight:500;color:var(--text-mute);font-size:11px;text-transform:uppercase;
-  letter-spacing:.08em;background:rgba(255,255,255,.015)}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:rgba(255,255,255,.014)}
-td.num{font-variant-numeric:tabular-nums}
-
-.mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px}
-.chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;
-  font-size:11.5px;font-weight:500;letter-spacing:.005em;font-family:'JetBrains Mono',monospace}
-.chip.violet{color:#c4b5fd;background:rgba(139,92,246,.14);border:1px solid rgba(139,92,246,.28)}
-.chip.dim{color:var(--text-dim);background:var(--surface-hi);border:1px solid var(--border)}
-.chip.green{color:#86efac;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.25)}
-.chip.amber{color:#fcd34d;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.25)}
-.chip.red{color:#fca5a5;background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.25)}
-.dot-led{width:7px;height:7px;border-radius:50%;display:inline-block}
-.dot-led.green{background:var(--green);box-shadow:0 0 8px var(--green)}
-.dot-led.amber{background:var(--amber);box-shadow:0 0 8px var(--amber)}
-.dot-led.red{background:var(--red);box-shadow:0 0 8px var(--red)}
-
-.muted{color:var(--text-mute);font-size:12.5px}
-.provider-name{font-weight:500;color:var(--text)}
-.provider-url{color:var(--text-mute);font-size:12px;margin-top:2px;
+/* section */
+.section{margin:38px 0}
+.section-title{display:flex;align-items:baseline;
+  justify-content:space-between;margin-bottom:16px;gap:14px}
+.section-title h2{font-size:17px;font-weight:600;letter-spacing:-.015em}
+.section-title .count{color:var(--text-mute);font-size:12.5px;
   font-family:'JetBrains Mono',monospace}
 
-.flash{display:flex;gap:12px;align-items:flex-start;padding:16px 18px;border-radius:var(--radius);
-  margin-bottom:22px;background:linear-gradient(135deg,rgba(139,92,246,.14),rgba(34,211,238,.07));
-  border:1px solid rgba(139,92,246,.3);position:relative;overflow:hidden;
-  animation:slideIn .35s cubic-bezier(.2,.9,.25,1)}
-@keyframes slideIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
-.flash .icon{width:34px;height:34px;border-radius:9px;flex-shrink:0;display:grid;
-  place-items:center;background:linear-gradient(135deg,var(--violet),var(--cyan));
-  box-shadow:0 0 20px rgba(139,92,246,.5)}
+/* card */
+.card{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);padding:24px 24px 22px;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  position:relative;overflow:hidden;transition:border-color .22s ease}
+.card:hover{border-color:var(--border-hi)}
+.card::before{content:'';position:absolute;top:0;left:24px;right:24px;
+  height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.14),transparent)}
+
+/* form */
+.field{margin-bottom:15px}
+.field label{display:block;font-size:12px;color:var(--text-dim);
+  font-weight:500;margin-bottom:7px;letter-spacing:.01em}
+.field input,.field textarea,.field select{
+  width:100%;background:rgba(0,0,0,.4);color:var(--text);
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:12px 14px;font:inherit;font-size:14px;
+  transition:all .16s ease;outline:none}
+.field input::placeholder,.field textarea::placeholder{color:var(--text-mute)}
+.field input:focus,.field textarea:focus,.field select:focus{
+  border-color:rgba(168,85,247,.6);background:rgba(0,0,0,.55);
+  box-shadow:0 0 0 3px rgba(168,85,247,.16)}
+.field textarea{min-height:100px;resize:vertical;
+  font-family:'JetBrains Mono',ui-monospace,monospace;
+  font-size:12.5px;line-height:1.7}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px}
+.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+
+/* buttons */
+button,.btn{font:inherit;font-size:13.5px;font-weight:500;border:none;
+  cursor:pointer;padding:11px 17px;border-radius:var(--radius-sm);
+  transition:all .16s ease;letter-spacing:-.005em;
+  display:inline-flex;align-items:center;gap:7px;
+  font-family:inherit}
+.btn-primary{color:#fff;
+  background:linear-gradient(135deg,var(--violet),var(--indigo));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.2),
+    0 8px 24px -8px rgba(168,85,247,.75)}
+.btn-primary:hover{transform:translateY(-1px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.2),
+    0 12px 32px -8px rgba(168,85,247,.9)}
+.btn-primary:active{transform:translateY(0)}
+.btn-ghost{color:var(--text-dim);background:var(--surface-hi);
+  border:1px solid var(--border)}
+.btn-ghost:hover{color:var(--text);border-color:var(--border-hi);
+  background:rgba(255,255,255,.08)}
+.btn-icon{color:var(--text-mute);background:transparent;padding:8px 10px;
+  border-radius:9px;border:1px solid transparent;
+  transition:all .16s ease}
+.btn-icon:hover{color:var(--red);background:rgba(248,113,113,.1);
+  border-color:rgba(248,113,113,.25)}
+.btn-icon.neutral:hover{color:var(--text);background:var(--surface-hi);
+  border-color:var(--border)}
+.btn-sm{padding:7px 12px;font-size:12.5px}
+
+/* table */
+.tbl-wrap{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;
+  backdrop-filter:blur(14px)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:15px 18px;font-size:13.5px;
+  border-bottom:1px solid var(--border);vertical-align:middle}
+th{font-weight:500;color:var(--text-mute);font-size:11px;
+  text-transform:uppercase;letter-spacing:.1em;
+  background:rgba(255,255,255,.018)}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.016)}
+td.num{font-variant-numeric:tabular-nums;
+  font-family:'JetBrains Mono',monospace}
+
+/* pills / badges */
+.mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12.5px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;
+  border-radius:999px;font-size:11.5px;font-weight:500;
+  letter-spacing:.005em;font-family:'JetBrains Mono',monospace}
+.chip.violet{color:#d8b4fe;background:rgba(168,85,247,.15);
+  border:1px solid rgba(168,85,247,.3)}
+.chip.dim{color:var(--text-dim);background:var(--surface-hi);
+  border:1px solid var(--border)}
+.chip.green{color:#86efac;background:rgba(52,211,153,.13);
+  border:1px solid rgba(52,211,153,.26)}
+.chip.amber{color:#fcd34d;background:rgba(251,191,36,.13);
+  border:1px solid rgba(251,191,36,.26)}
+.chip.red{color:#fca5a5;background:rgba(248,113,113,.13);
+  border:1px solid rgba(248,113,113,.26)}
+.chip.cyan{color:#67e8f9;background:rgba(34,211,238,.13);
+  border:1px solid rgba(34,211,238,.26)}
+.dot-led{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot-led.green{background:var(--green);box-shadow:0 0 9px var(--green)}
+.dot-led.amber{background:var(--amber);box-shadow:0 0 9px var(--amber)}
+.dot-led.red{background:var(--red);box-shadow:0 0 9px var(--red)}
+.dot-led.cyan{background:var(--cyan);box-shadow:0 0 9px var(--cyan)}
+
+.muted{color:var(--text-mute);font-size:12.5px}
+.provider-name{font-weight:500;color:var(--text);font-size:14px}
+.provider-url{color:var(--text-mute);font-size:11.5px;margin-top:3px;
+  font-family:'JetBrains Mono',monospace}
+
+/* progress bar */
+.pbar{position:relative;height:6px;border-radius:3px;
+  background:rgba(255,255,255,.06);overflow:hidden;margin-top:6px}
+.pbar .fill{height:100%;border-radius:3px;
+  background:linear-gradient(90deg,var(--violet),var(--cyan));
+  transition:width .5s ease, background .5s ease}
+.pbar.warn .fill{background:linear-gradient(90deg,var(--amber),var(--red))}
+.pbar.crit .fill{background:linear-gradient(90deg,var(--red),#b91c1c)}
+.pbar .text{position:absolute;right:0;top:-20px;font-size:10.5px;
+  color:var(--text-mute);font-family:'JetBrains Mono',monospace}
+
+/* flash */
+.flash{display:flex;gap:14px;align-items:flex-start;padding:18px 20px;
+  border-radius:var(--radius);margin-bottom:24px;
+  background:linear-gradient(135deg,rgba(168,85,247,.16),rgba(34,211,238,.08));
+  border:1px solid rgba(168,85,247,.32);position:relative;
+  overflow:hidden;animation:slideIn .4s cubic-bezier(.2,.9,.25,1)}
+@keyframes slideIn{from{opacity:0;transform:translateY(-8px)}
+  to{opacity:1;transform:translateY(0)}}
+.flash .icon{width:38px;height:38px;border-radius:11px;flex-shrink:0;
+  display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--violet),var(--cyan));
+  box-shadow:0 0 24px rgba(168,85,247,.6)}
 .flash .body{flex:1;min-width:0}
-.flash .title{font-weight:600;font-size:13.5px;margin-bottom:6px}
-.flash .key{font-family:'JetBrains Mono',monospace;font-size:13px;background:rgba(0,0,0,.45);
-  padding:10px 12px;border-radius:8px;border:1px solid var(--border);
-  user-select:all;word-break:break-all;color:#c4b5fd}
-.flash .copy{margin-top:8px}
-.err-box{padding:14px 16px;border-radius:var(--radius-sm);margin-bottom:18px;
-  background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.28);
-  color:#fca5a5;font-size:13.5px}
+.flash .title{font-weight:600;font-size:14px;margin-bottom:8px}
+.flash .key{font-family:'JetBrains Mono',monospace;font-size:13px;
+  background:rgba(0,0,0,.5);padding:11px 13px;border-radius:9px;
+  border:1px solid var(--border);user-select:all;word-break:break-all;
+  color:#d8b4fe}
+.flash .copy{margin-top:10px}
 
-.empty{padding:44px 24px;text-align:center;color:var(--text-mute);font-size:13.5px}
-.empty .icon{font-size:28px;margin-bottom:10px;opacity:.4}
+.err-box{padding:15px 17px;border-radius:var(--radius-sm);
+  margin-bottom:20px;background:rgba(248,113,113,.1);
+  border:1px solid rgba(248,113,113,.3);color:#fca5a5;font-size:13.5px}
 
-.login-wrap{position:relative;z-index:1;min-height:100vh;display:grid;place-items:center;
-  padding:24px}
-.login-card{width:100%;max-width:400px;padding:36px 32px 30px;border-radius:20px;
-  background:rgba(15,15,22,.75);border:1px solid var(--border-hi);
-  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
-  box-shadow:0 24px 80px -20px rgba(0,0,0,.7),
-    0 0 0 1px rgba(255,255,255,.03) inset;
-  animation:pop .5s cubic-bezier(.2,.9,.25,1)}
-@keyframes pop{from{opacity:0;transform:translateY(12px) scale(.98)}to{opacity:1;transform:none}}
-.login-card .logo-row{display:flex;align-items:center;gap:11px;margin-bottom:22px}
-.login-card h1{font-size:22px;font-weight:600;letter-spacing:-.02em;
-  background:linear-gradient(180deg,#fff,#b8b8c8);
+.empty{padding:50px 26px;text-align:center;color:var(--text-mute);
+  font-size:13.5px}
+.empty .icon{font-size:30px;margin-bottom:12px;opacity:.4}
+
+/* login */
+.login-wrap{position:relative;z-index:1;min-height:100vh;
+  display:grid;place-items:center;padding:24px}
+.login-card{width:100%;max-width:420px;padding:40px 34px 32px;
+  border-radius:24px;background:rgba(14,14,22,.8);
+  border:1px solid var(--border-hi);
+  backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);
+  box-shadow:var(--shadow-lg),0 0 0 1px rgba(255,255,255,.04) inset;
+  animation:pop .55s cubic-bezier(.2,.9,.25,1)}
+@keyframes pop{from{opacity:0;transform:translateY(14px) scale(.97)}
+  to{opacity:1;transform:none}}
+.login-card .logo-row{display:flex;align-items:center;gap:12px;
+  margin-bottom:24px}
+.login-card h1{font-size:24px;font-weight:600;letter-spacing:-.025em;
+  background:linear-gradient(180deg,#fff,#b8b8cc);
   -webkit-background-clip:text;background-clip:text;color:transparent}
-.login-card p.sub{color:var(--text-dim);font-size:13.5px;margin:-14px 0 24px}
+.login-card p.sub{color:var(--text-dim);font-size:13.5px;
+  margin:-16px 0 26px}
 
-.footer{margin:56px 0 32px;padding-top:22px;border-top:1px solid var(--border);
-  color:var(--text-mute);font-size:12.5px;display:flex;justify-content:space-between;
-  align-items:center;flex-wrap:wrap;gap:10px}
-.footer code{font-family:'JetBrains Mono',monospace;background:var(--surface-hi);
-  padding:3px 8px;border-radius:6px;border:1px solid var(--border);font-size:11.5px;
-  color:var(--text-dim)}
+/* footer */
+.footer{margin:60px 0 34px;padding-top:24px;
+  border-top:1px solid var(--border);color:var(--text-mute);
+  font-size:12.5px;display:flex;justify-content:space-between;
+  align-items:center;flex-wrap:wrap;gap:12px}
+.footer code{font-family:'JetBrains Mono',monospace;
+  background:var(--surface-hi);padding:4px 9px;border-radius:7px;
+  border:1px solid var(--border);font-size:11.5px;color:var(--text-dim)}
 
-@media (max-width:820px){
+/* playground */
+.playground{position:relative;z-index:1;max-width:960px;margin:0 auto;
+  padding:0 32px}
+.chat-window{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);padding:24px;min-height:460px;
+  max-height:62vh;overflow-y:auto;margin-bottom:18px;
+  scroll-behavior:smooth}
+.chat-window::-webkit-scrollbar{width:8px}
+.chat-window::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);
+  border-radius:4px}
+.msg{margin-bottom:18px;animation:slideIn .28s ease}
+.msg .role{font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--text-mute);margin-bottom:6px}
+.msg.user .content{background:rgba(168,85,247,.14);padding:12px 16px;
+  border-radius:14px;display:inline-block;max-width:80%;
+  border:1px solid rgba(168,85,247,.22)}
+.msg.assistant .content{background:rgba(0,0,0,.35);padding:12px 16px;
+  border-radius:14px;white-space:pre-wrap;max-width:90%;
+  border:1px solid var(--border)}
+.input-area{position:sticky;bottom:22px;z-index:3}
+.input-row{display:flex;gap:9px;align-items:flex-end;
+  background:var(--surface-elev);border:1px solid var(--border);
+  border-radius:var(--radius);padding:12px;
+  backdrop-filter:blur(18px);
+  box-shadow:var(--shadow-md)}
+.input-row textarea{flex:1;min-height:64px;max-height:200px;resize:none;
+  background:transparent;color:var(--text);border:none;
+  padding:8px 10px;font:inherit;font-size:14px;outline:none;
+  font-family:inherit}
+.attachments{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;
+  padding:0 12px}
+.toolbar{display:flex;gap:6px;align-items:center;margin-bottom:10px;
+  flex-wrap:wrap;padding:0 4px}
+.model-select{background:rgba(0,0,0,.4);color:var(--text);
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:8px 12px;font:inherit;font-size:13px;outline:none;
+  font-family:'JetBrains Mono',monospace}
+.stream-toggle{font-size:12.5px;color:var(--text-dim);display:flex;
+  align-items:center;gap:6px;padding:8px 12px;
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm)}
+.params-panel{display:flex;gap:22px;flex-wrap:wrap;padding:16px 20px;
+  margin-top:12px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);backdrop-filter:blur(14px)}
+.params-panel label{display:flex;align-items:center;gap:9px;
+  font-size:13px;color:var(--text-dim)}
+.params-panel input[type=range]{width:130px;accent-color:var(--violet)}
+.params-panel input[type=number]{width:90px;background:rgba(0,0,0,.4);
+  border:1px solid var(--border);border-radius:8px;padding:6px 10px;
+  color:var(--text);font:inherit;font-size:13px;outline:none}
+.cursor{display:inline-block;width:8px;height:16px;
+  background:var(--violet);animation:blink .85s infinite;
+  vertical-align:middle;border-radius:2px}
+@keyframes blink{50%{opacity:0}}
+
+/* keys page */
+.kv-row{display:flex;align-items:center;gap:10px;
+  padding:14px 16px;border-bottom:1px solid var(--border);
+  transition:background .15s ease}
+.kv-row:last-child{border-bottom:none}
+.kv-row:hover{background:rgba(255,255,255,.016)}
+.kv-row .kv-id{font-family:'JetBrains Mono',monospace;font-size:12px;
+  color:var(--text-mute);min-width:36px}
+.kv-row .kv-key{font-family:'JetBrains Mono',monospace;font-size:12.5px;
+  color:#d8b4fe;flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.kv-row .kv-limits{display:flex;gap:8px;flex-wrap:wrap}
+.limit-input{width:90px;background:rgba(0,0,0,.4);color:var(--text);
+  border:1px solid var(--border);border-radius:8px;
+  padding:7px 10px;font:inherit;font-size:12.5px;outline:none;
+  font-family:'JetBrains Mono',monospace}
+.limit-input:focus{border-color:rgba(168,85,247,.6)}
+.kv-row .kv-stats{font-family:'JetBrains Mono',monospace;
+  font-size:11.5px;color:var(--text-mute);min-width:130px}
+
+/* logs */
+.log-tbl td{font-family:'JetBrains Mono',monospace;font-size:12px;
+  padding:11px 14px}
+.log-status{font-weight:600}
+.log-status.ok{color:var(--green)}
+.log-status.retry{color:var(--amber)}
+.log-status.err{color:var(--red)}
+
+/* responsive */
+@media (max-width:900px){
   .stats{grid-template-columns:repeat(2,1fr)}
   .grid-3{grid-template-columns:1fr}
-  .hero h1{font-size:26px}
+  .grid-4{grid-template-columns:1fr 1fr}
+  .hero h1{font-size:28px}
+  .container{padding:0 20px}
   th:nth-child(4),td:nth-child(4),
   th:nth-child(6),td:nth-child(6){display:none}
 }
 """
 
 
+# ============================================================
+# TEMPLATES
+# ============================================================
 def page(title: str, body: str, container_class: str = "container") -> str:
     return f"""<!doctype html>
 <html lang="ru">
@@ -740,11 +1032,16 @@ def page(title: str, body: str, container_class: str = "container") -> str:
 BRAND_MARK = '<span class="mark"></span>'
 
 
-def nav_bar() -> str:
+def nav_bar(active: str = "") -> str:
+    def cls(name):
+        return "nav-link active" if active == name else "nav-link"
     return f"""
 <div class="nav">
   <a href="/admin/" class="brand">{BRAND_MARK}<span>cxepy<span class="dot">/</span>admin</span></a>
   <div class="nav-actions">
+    <a class="{cls('dashboard')}" href="/admin/">Дашборд</a>
+    <a class="{cls('playground')}" href="/playground">Playground</a>
+    <a class="{cls('logs')}" href="/admin/logs">Логи</a>
     <a class="nav-link" href="/admin/logout">Выйти</a>
   </div>
 </div>"""
@@ -767,7 +1064,7 @@ def login_page(err: str = "") -> str:
         <label>Пароль</label>
         <input name="password" type="password" autocomplete="current-password" required>
       </div>
-      <button type="submit" class="btn-primary" style="width:100%;justify-content:center;padding:12px">
+      <button type="submit" class="btn-primary" style="width:100%;justify-content:center;padding:13px">
         Войти в дашборд
       </button>
     </form>
@@ -790,6 +1087,24 @@ def _key_status_chip(p: ProviderState) -> str:
     return '<span class="chip green"><span class="dot-led green"></span>готов</span>'
 
 
+def _provider_rpm_stats(p: ProviderState) -> tuple:
+    """Суммарный текущий и лимитный RPM/TPM провайдера."""
+    now = time.monotonic()
+    total_rpm_now = 0
+    total_rpm_max = 0
+    total_tpm_now = 0
+    total_tpm_max = 0
+    for k in p.keys:
+        if k.disabled:
+            continue
+        p._prune_windows(k, now)
+        total_rpm_now += len(k.rpm_window)
+        total_rpm_max += k.rpm_limit or 0
+        total_tpm_now += sum(t for _, t in k.tpm_window)
+        total_tpm_max += k.tpm_limit or 0
+    return total_rpm_now, total_rpm_max, total_tpm_now, total_tpm_max
+
+
 def dashboard_page(st: AppState, new_key: str = "") -> str:
     total_providers = len(st.providers)
     total_keys = sum(len(p.keys) for p in st.providers.values())
@@ -804,23 +1119,39 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
     stats_html = f"""
 <div class="stats">
   <div class="stat violet">
-    <div class="label">Провайдеры</div>
+    <div class="label">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4v10l-9 4-9-4z"/></svg>
+      Провайдеры
+    </div>
     <div class="value">{total_providers}</div>
+    <div class="delta">{total_keys} ключей всего</div>
     <div class="glow"></div>
   </div>
   <div class="stat cyan">
-    <div class="label">Ключи провайдеров</div>
+    <div class="label">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M7 12h10"/></svg>
+      Ключи
+    </div>
     <div class="value">{active_keys}<span class="sub">/ {total_keys}</span></div>
+    <div class="delta"><span class="up">{active_keys} активных</span> · <span class="down">{total_keys-active_keys} off</span></div>
     <div class="glow"></div>
   </div>
   <div class="stat amber">
-    <div class="label">В работе</div>
+    <div class="label">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/></svg>
+      В работе
+    </div>
     <div class="value">{inflight}</div>
+    <div class="delta">{total_reqs} запросов всего</div>
     <div class="glow"></div>
   </div>
   <div class="stat green">
-    <div class="label">Успешность</div>
+    <div class="label">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+      Успешность
+    </div>
     <div class="value">{rate:.1f}<span class="sub">%</span></div>
+    <div class="delta">{ok_reqs} ok / {total_reqs-ok_reqs} err</div>
     <div class="glow"></div>
   </div>
 </div>"""
@@ -835,24 +1166,47 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
         rate_p = (succ_p / total_p * 100) if total_p else 100.0
         ti = sum(k.tokens_in for k in p.keys)
         to = sum(k.tokens_out for k in p.keys)
-        tokens_note = f"{ti:,} in / {to:,} out".replace(",", " ")
+
+        rpm_now, rpm_max, tpm_now, tpm_max = _provider_rpm_stats(p)
+        rpm_pct = (rpm_now / rpm_max * 100) if rpm_max else 0
+        tpm_pct = (tpm_now / tpm_max * 100) if tpm_max else 0
+
+        rpm_cls = "pbar"
+        if rpm_pct > 90:
+            rpm_cls += " crit"
+        elif rpm_pct > 70:
+            rpm_cls += " warn"
+
+        rpm_bar = ""
+        if rpm_max:
+            rpm_bar = f"""
+            <div class="{rpm_cls}">
+              <div class="fill" style="width:{min(rpm_pct,100):.0f}%"></div>
+            </div>
+            <div class="muted" style="margin-top:4px;font-family:'JetBrains Mono',monospace;font-size:10.5px">
+              RPM {rpm_now}/{rpm_max}
+            </div>"""
+
         disabled_note = (
             f' <span class="chip red" style="font-size:10.5px">{disabled_n} off</span>'
             if disabled_n else ""
         )
+
         rows.append(f"""
         <tr>
           <td>
             <div class="provider-name">{p.name}</div>
             <div class="provider-url">{p.base_url}</div>
-            <div class="muted" style="margin-top:4px;font-family:'JetBrains Mono',monospace;
-                 font-size:11px">{tokens_note} tok</div>
+            <div class="muted" style="margin-top:5px;font-family:'JetBrains Mono',monospace;font-size:11px">
+              {ti:,} in / {to:,} out tok
+            </div>
+            {rpm_bar}
           </td>
           <td><span class="chip violet">{p.model_id}</span></td>
           <td>{_key_status_chip(p)}{disabled_note}</td>
-          <td class="num">{active} / {len(p.keys)}</td>
+          <td class="num"><a href="/admin/providers/{p.id}/keys" style="color:var(--cyan);text-decoration:underline">{active} / {len(p.keys)}</a></td>
           <td class="num">{inflight_p}</td>
-          <td class="num">{rate_p:.0f}% <span class="muted">({succ_p}/{total_p})</span></td>
+          <td class="num">{rate_p:.0f}%</td>
           <td>
             <div style="display:flex;gap:4px;justify-content:flex-end">
               <form method="post" action="/admin/providers/{p.id}/keys" style="display:inline"
@@ -904,7 +1258,7 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
                       '<span class="chip red">отключён</span>')
             ck_rows.append(f"""
             <tr>
-              <td><span class="mono" style="color:#c4b5fd">{ck['key_prefix']}…</span></td>
+              <td><span class="mono" style="color:#d8b4fe">{ck['key_prefix']}…</span></td>
               <td>{pname}</td>
               <td>{status}</td>
               <td>
@@ -936,7 +1290,7 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
         flash_html = f"""
 <div class="flash">
   <div class="icon">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff"
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff"
          stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M20 6L9 17l-5-5"/>
     </svg>
@@ -954,11 +1308,14 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
 </div>"""
 
     body = f"""
-{nav_bar()}
+{nav_bar('dashboard')}
 
 <div class="hero">
-  <h1>Дашборд</h1>
-  <p>Управление провайдерами, ключами и ротацией</p>
+  <div>
+    <h1>Дашборд</h1>
+    <p>Управление провайдерами, ключами и ротацией</p>
+  </div>
+  <div class="pulse"><span class="led"></span><span id="live-status">live · 0 in-flight</span></div>
 </div>
 
 {flash_html}
@@ -990,7 +1347,7 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
         <textarea name="api_keys" required
           placeholder="sk-aaaaaaaaaaaaaaaaaaaaaaaa&#10;sk-bbbbbbbbbbbbbbbbbbbbbbbb&#10;sk-cccccccccccccccccccccccc"></textarea>
       </div>
-      <div style="display:flex;justify-content:flex-end;margin-top:4px">
+      <div style="display:flex;justify-content:flex-end;margin-top:6px">
         <button type="submit" class="btn-primary">Добавить провайдера →</button>
       </div>
     </form>
@@ -1017,8 +1374,429 @@ def dashboard_page(st: AppState, new_key: str = "") -> str:
   <span>Endpoint: <code>POST /v1/chat/completions</code> · <code>Authorization: Bearer cxepy-…</code></span>
   <span>cxepy · OpenAI-compatible proxy</span>
 </div>
+
+<script>
+const evt = new EventSource('/admin/events');
+evt.onmessage = (e) => {{
+  try {{
+    const d = JSON.parse(e.data);
+    document.getElementById('live-status').textContent =
+      'live · ' + d.total_inflight + ' in-flight';
+  }} catch (x) {{}}
+}};
+evt.onerror = () => {{
+  document.getElementById('live-status').textContent = 'reconnecting…';
+}};
+</script>
 """
     return page("Дашборд", body)
+
+
+def keys_page(p: ProviderState) -> str:
+    """Страница управления ключами провайдера с инлайн-редактором лимитов."""
+    now = time.monotonic()
+    rows = []
+    for k in p.keys:
+        p._prune_windows(k, now)
+        rpm_now = len(k.rpm_window)
+        tpm_now = sum(t for _, t in k.tpm_window)
+
+        if k.disabled:
+            status = f'<span class="chip red"><span class="dot-led red"></span>{k.disabled_reason or "off"}</span>'
+        elif k.cooldown_until > now:
+            status = '<span class="chip amber"><span class="dot-led amber"></span>cooldown</span>'
+        else:
+            status = '<span class="chip green"><span class="dot-led green"></span>ready</span>'
+
+        masked = f"{k.value[:8]}…{k.value[-4:]}" if len(k.value) > 14 else k.value
+
+        rows.append(f"""
+        <div class="kv-row" data-kid="{k.id}">
+          <span class="kv-id">#{k.id}</span>
+          <span class="kv-key" title="ID: {k.id}">{masked}</span>
+          <span class="kv-limits">
+            <input class="limit-input" type="number" placeholder="RPM" value="{k.rpm_limit}" min="0" onchange="saveLimits({k.id})" data-field="rpm_limit">
+            <input class="limit-input" type="number" placeholder="TPM" value="{k.tpm_limit}" min="0" onchange="saveLimits({k.id})" data-field="tpm_limit">
+            <input class="limit-input" type="number" placeholder="Req" value="{k.request_limit}" min="0" onchange="saveLimits({k.id})" data-field="request_limit">
+            <input class="limit-input" type="number" placeholder="Tok" value="{k.token_limit}" min="0" onchange="saveLimits({k.id})" data-field="token_limit">
+          </span>
+          <span class="kv-stats">
+            {rpm_now}/{k.rpm_limit or '∞'} rpm · {tpm_now}/{k.tpm_limit or '∞'} tpm
+          </span>
+          <span class="kv-stats">{k.tokens_in} in / {k.tokens_out} out</span>
+          <span class="kv-stats">{k.total} req · {k.success} ok</span>
+          {status}
+          <form method="post" action="/admin/keys/{k.id}/delete"
+                onsubmit="return confirm('Удалить ключ?')" style="margin-left:auto">
+            <button type="submit" class="btn-icon" title="Удалить">×</button>
+          </form>
+        </div>""")
+
+    if not rows:
+        rows_html = '<div class="empty"><div class="icon">⚿</div>У провайдера нет ключей</div>'
+    else:
+        rows_html = f"""
+<div class="card" style="padding:0">
+  <div class="kv-row" style="background:rgba(255,255,255,.02);font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--text-mute)">
+    <span class="kv-id">ID</span>
+    <span style="flex:1">Ключ</span>
+    <span style="min-width:380px">Лимиты (0 = без лимита)</span>
+    <span style="min-width:150px">Текущий</span>
+    <span style="min-width:130px">Токены</span>
+    <span style="min-width:110px">Запросы</span>
+    <span style="min-width:80px">Статус</span>
+    <span style="width:40px"></span>
+  </div>
+  {''.join(rows)}
+</div>"""
+
+    body = f"""
+{nav_bar('dashboard')}
+
+<div class="hero">
+  <div>
+    <h1>{p.name}</h1>
+    <p>{p.base_url} · модель <span class="mono" style="color:var(--violet)">{p.model_id}</span></p>
+  </div>
+  <div>
+    <a class="btn-ghost" href="/admin/">← К провайдерам</a>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">
+    <h2>Ключи</h2>
+    <span class="count">{len(p.keys)} шт.</span>
+  </div>
+  {rows_html}
+</div>
+
+<div class="section">
+  <div class="section-title">
+    <h2>Добавить ключ</h2>
+    <span class="count">один ключ</span>
+  </div>
+  <div class="card">
+    <form method="post" action="/admin/providers/{p.id}/keys">
+      <div class="field">
+        <label>API-ключ</label>
+        <input name="api_key" placeholder="sk-..." required>
+      </div>
+      <div style="display:flex;justify-content:flex-end">
+        <button type="submit" class="btn-primary">Добавить</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="footer">
+  <span>Лимиты применяются мгновенно · 0 = без лимита</span>
+  <span>cxepy · ключи провайдера</span>
+</div>
+
+<script>
+async function saveLimits(kid) {{
+  const row = document.querySelector('.kv-row[data-kid="' + kid + '"]');
+  const body = new URLSearchParams();
+  row.querySelectorAll('input[data-field]').forEach(inp => {{
+    body.append(inp.dataset.field, inp.value || '0');
+  }});
+  const resp = await fetch('/admin/keys/' + kid + '/limits', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+    body: body.toString()
+  }});
+  if (!resp.ok) {{
+    alert('Не удалось сохранить: ' + resp.status);
+  }}
+}}
+</script>
+"""
+    return page(f"{p.name} · ключи", body)
+
+
+def playground_page(st: AppState) -> str:
+    models = sorted({p.model_id for p in st.providers.values()})
+    model_options = "".join(
+        f'<option value="{m}">{m}</option>' for m in models
+    ) or '<option value="">нет моделей</option>'
+
+    body = f"""
+{nav_bar('playground')}
+
+<div class="hero">
+  <div>
+    <h1>Playground</h1>
+    <p>Тестируй модели прямо в браузере — с файлами и фото</p>
+  </div>
+</div>
+
+<div class="playground">
+  <div class="chat-window" id="chat">
+    <div class="msg assistant">
+      <div class="role">cxepy</div>
+      <div class="content">Привет! Выбери модель снизу и напиши сообщение. Поддерживаются файлы (PDF, TXT) и изображения (PNG, JPG, GIF, WebP). Можно вставлять фото через Ctrl+V.</div>
+    </div>
+  </div>
+
+  <div class="input-area">
+    <div class="attachments" id="attachments"></div>
+    <div class="input-row">
+      <div style="display:flex;flex-direction:column;flex:1;gap:6px">
+        <div class="toolbar" style="margin:0">
+          <button type="button" class="btn-ghost btn-sm" onclick="document.getElementById('file-input').click()">
+            📎 Файл
+          </button>
+          <input type="file" id="file-input" multiple hidden
+                 accept="image/*,.pdf,.txt,.md,.csv,.json"
+                 onchange="handleFiles(this.files)">
+          <button type="button" class="btn-ghost btn-sm" onclick="pasteImage()">🖼 Фото</button>
+          <button type="button" class="btn-ghost btn-sm" onclick="toggleParams()">⚙ Параметры</button>
+          <select id="model-select" class="model-select">{model_options}</select>
+          <label class="stream-toggle">
+            <input type="checkbox" id="stream-toggle" checked> стрим
+          </label>
+        </div>
+        <textarea id="prompt" placeholder="Напиши сообщение… (Shift+Enter — новая строка)"
+                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();send()}}"></textarea>
+      </div>
+      <button id="send-btn" class="btn-primary" onclick="send()" style="padding:14px 18px;font-size:16px">→</button>
+      <button id="stop-btn" class="btn-ghost" onclick="stop()"
+              style="display:none;padding:14px 18px;font-size:16px">■</button>
+    </div>
+
+    <div class="params-panel" id="params" style="display:none">
+      <label>Temperature <input type="range" id="temperature" min="0" max="2" step="0.1" value="1"><span id="temp-val" class="mono">1.0</span></label>
+      <label>Top P <input type="range" id="top_p" min="0" max="1" step="0.05" value="1"><span id="top_p-val" class="mono">1.0</span></label>
+      <label>Max Tokens <input type="number" id="max_tokens" value="2048" min="1"></label>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <span>Playground использует твою админскую сессию · cxepy-ключи не светятся в браузере</span>
+  <span>cxepy · playground</span>
+</div>
+
+<script>
+const chat = document.getElementById('chat');
+const prompt = document.getElementById('prompt');
+const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
+let controller = null;
+let currentFiles = [];
+
+function addMessage(role, content) {{
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = '<div class="role">' + role + '</div>' +
+                  '<div class="content">' + content + '</div>';
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}}
+
+function handleFiles(files) {{
+  for (const f of files) {{
+    currentFiles.push(f);
+    const chip = document.createElement('span');
+    chip.className = 'chip violet';
+    chip.textContent = f.name;
+    document.getElementById('attachments').appendChild(chip);
+  }}
+}}
+
+function pasteImage() {{
+  if (navigator.clipboard && navigator.clipboard.read) {{
+    navigator.clipboard.read().then(items => {{
+      for (const item of items) {{
+        for (const type of item.types) {{
+          if (type.startsWith('image/')) {{
+            item.getType(type).then(blob => {{
+              const file = new File([blob], 'pasted.png', {{ type }});
+              handleFiles([file]);
+            }});
+          }}
+        }}
+      }}
+    }}).catch(e => alert('Не удалось прочитать буфер: ' + e.message));
+  }} else {{
+    alert('Браузер не поддерживает чтение буфера обмена. Используй Ctrl+V или кнопку «Файл».');
+  }}
+}}
+
+prompt.addEventListener('paste', e => {{
+  const items = e.clipboardData.items;
+  for (const item of items) {{
+    if (item.type.startsWith('image/')) {{
+      e.preventDefault();
+      const file = item.getAsFile();
+      handleFiles([file]);
+    }}
+  }}
+}});
+
+function toggleParams() {{
+  const p = document.getElementById('params');
+  p.style.display = p.style.display === 'none' ? 'flex' : 'none';
+}}
+
+document.getElementById('temperature').addEventListener('input', e => {{
+  document.getElementById('temp-val').textContent = parseFloat(e.target.value).toFixed(1);
+}});
+document.getElementById('top_p').addEventListener('input', e => {{
+  document.getElementById('top_p-val').textContent = parseFloat(e.target.value).toFixed(2);
+}});
+
+async function send() {{
+  const text = prompt.value.trim();
+  if (!text && currentFiles.length === 0) return;
+
+  addMessage('user', text + (currentFiles.length ? ' <span class="muted">📎 ' + currentFiles.length + ' файл(ов)</span>' : ''));
+  prompt.value = '';
+  document.getElementById('attachments').innerHTML = '';
+
+  const form = new FormData();
+  form.append('model', document.getElementById('model-select').value);
+  form.append('messages', JSON.stringify([
+    {{ role: 'user', content: text || '(вложение)' }}
+  ]));
+  form.append('stream', document.getElementById('stream-toggle').checked);
+  form.append('temperature', document.getElementById('temperature').value);
+  form.append('top_p', document.getElementById('top_p').value);
+  form.append('max_tokens', document.getElementById('max_tokens').value);
+  for (const f of currentFiles) form.append('files', f);
+  currentFiles = [];
+
+  const msgDiv = addMessage('assistant', '<span class="cursor"></span>');
+  const contentDiv = msgDiv.querySelector('.content');
+  let acc = '';
+
+  controller = new AbortController();
+  sendBtn.style.display = 'none';
+  stopBtn.style.display = 'inline-flex';
+
+  try {{
+    const resp = await fetch('/pg/chat/completions', {{
+      method: 'POST',
+      body: form,
+      signal: controller.signal
+    }});
+
+    if (!resp.ok) {{
+      const errText = await resp.text();
+      contentDiv.innerHTML = '<span style="color:var(--red)">Ошибка ' + resp.status + ': ' + errText + '</span>';
+      return;
+    }}
+
+    const ctype = resp.headers.get('content-type') || '';
+    if (!ctype.includes('text/event-stream')) {{
+      const data = await resp.json();
+      acc = data.choices?.[0]?.message?.content || JSON.stringify(data);
+      contentDiv.textContent = acc;
+      return;
+    }}
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {{
+      const {{ done, value }} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {{ stream: true }});
+      const lines = buffer.split('\\n');
+      buffer = lines.pop();
+      for (const line of lines) {{
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {{
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) {{
+            acc += delta;
+            contentDiv.textContent = acc;
+          }}
+        }} catch (e) {{}}
+      }}
+      chat.scrollTop = chat.scrollHeight;
+    }}
+  }} catch (e) {{
+    if (e.name !== 'AbortError') {{
+      contentDiv.textContent = acc + '\\n[ошибка: ' + e.message + ']';
+    }} else {{
+      contentDiv.textContent = acc + '\\n[остановлено]';
+    }}
+  }} finally {{
+    sendBtn.style.display = 'inline-flex';
+    stopBtn.style.display = 'none';
+    controller = null;
+  }}
+}}
+
+function stop() {{
+  if (controller) controller.abort();
+}}
+</script>
+"""
+    return page("Playground", body, container_class="container-fluid")
+
+
+def logs_page(st: AppState) -> str:
+    rows = []
+    for entry in reversed(list(st.log_buffer)):
+        ts = time.strftime("%H:%M:%S", time.localtime(entry.get("ts", 0)))
+        status = entry.get("status", 0)
+        cls = "ok" if 200 <= status < 300 else ("retry" if status in (429, 500, 502, 503, 504) else "err")
+        rows.append(f"""
+        <tr>
+          <td class="muted">{ts}</td>
+          <td>{entry.get('provider', '-')}</td>
+          <td>#{entry.get('key_id', '-')}</td>
+          <td class="muted">{entry.get('client_prefix', '-')}</td>
+          <td><span class="log-status {cls}">{status}</span></td>
+          <td class="num">{entry.get('ms', '-')} ms</td>
+          <td class="muted">{entry.get('note', '')}</td>
+        </tr>""")
+
+    if not rows:
+        rows_html = '<div class="empty"><div class="icon">≡</div>Логи пусты — сделай пару запросов</div>'
+        table = f'<div class="tbl-wrap">{rows_html}</div>'
+    else:
+        table = f"""
+<div class="tbl-wrap">
+  <table class="log-tbl">
+    <thead>
+      <tr>
+        <th>Время</th><th>Провайдер</th><th>Ключ</th>
+        <th>Клиент</th><th>Статус</th><th>Лат.</th><th>Заметка</th>
+      </tr>
+    </thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>"""
+
+    body = f"""
+{nav_bar('logs')}
+
+<div class="hero">
+  <div>
+    <h1>Логи запросов</h1>
+    <p>Последние {LOG_BUFFER_SIZE} запросов в памяти</p>
+  </div>
+</div>
+
+<div class="section">
+  {table}
+</div>
+
+<div class="footer">
+  <span>Обновление при перезагрузке · ring buffer {LOG_BUFFER_SIZE}</span>
+  <span>cxepy · logs</span>
+</div>
+"""
+    return page("Логи", body)
 
 
 # ============================================================
@@ -1148,6 +1926,86 @@ async def dashboard(request: Request):
     return resp
 
 
+@app.get("/admin/logs", response_class=HTMLResponse)
+async def logs_view(request: Request):
+    require_admin(request)
+    return HTMLResponse(logs_page(request.app.state.cxepy))
+
+
+@app.get("/admin/events")
+async def admin_events(request: Request):
+    require_admin(request)
+    st: AppState = request.app.state.cxepy
+
+    async def gen():
+        while True:
+            data = {
+                "total_inflight": total_in_flight(st),
+                "providers": [
+                    {
+                        "id": p.id,
+                        "name": p.name,
+                        "inflight": sum(k.in_flight for k in p.keys),
+                        "active_keys": sum(1 for k in p.keys if not k.disabled),
+                        "total_keys": len(p.keys),
+                    }
+                    for p in st.providers.values()
+                ],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/admin/providers/{pid}/keys", response_class=HTMLResponse)
+async def provider_keys_page(request: Request, pid: int):
+    require_admin(request)
+    st: AppState = request.app.state.cxepy
+    p = st.providers.get(pid)
+    if not p:
+        raise HTTPException(404, "provider not found")
+    return HTMLResponse(keys_page(p))
+
+
+@app.post("/admin/keys/{kid}/limits")
+async def update_key_limits(
+    request: Request,
+    kid: int,
+    rpm_limit: int = Form(0),
+    tpm_limit: int = Form(0),
+    request_limit: int = Form(0),
+    token_limit: int = Form(0),
+):
+    require_admin(request)
+    with conn() as c:
+        c.execute(
+            "UPDATE provider_keys SET rpm_limit=?, tpm_limit=?, "
+            "request_limit=?, token_limit=? WHERE id=?",
+            (rpm_limit, tpm_limit, request_limit, token_limit, kid),
+        )
+    st: AppState = request.app.state.cxepy
+    for p in st.providers.values():
+        for k in p.keys:
+            if k.id == kid:
+                k.rpm_limit = rpm_limit
+                k.tpm_limit = tpm_limit
+                k.request_limit = request_limit
+                k.token_limit = token_limit
+    return {"status": "ok"}
+
+
+@app.post("/admin/keys/{kid}/delete")
+async def delete_key(request: Request, kid: int):
+    require_admin(request)
+    with conn() as c:
+        c.execute("DELETE FROM provider_keys WHERE id=?", (kid,))
+    load_state(request.app.state.cxepy)
+    # Возвращаемся назад
+    ref = request.headers.get("referer", "/admin/")
+    return RedirectResponse(ref, status_code=303)
+
+
 @app.post("/admin/providers")
 async def add_provider(
     request: Request,
@@ -1221,7 +2079,8 @@ async def add_provider_key(request: Request, pid: int, api_key: str = Form(...))
         )
     load_state(request.app.state.cxepy)
     log.info(f"provider {pid}: added key")
-    return RedirectResponse("/admin/", status_code=303)
+    ref = request.headers.get("referer", "/admin/")
+    return RedirectResponse(ref, status_code=303)
 
 
 @app.post("/admin/providers/{pid}/delete")
@@ -1241,6 +2100,140 @@ async def delete_client_key(request: Request, cid: int):
         c.execute("DELETE FROM client_keys WHERE id=?", (cid,))
     load_state(request.app.state.cxepy)
     return RedirectResponse("/admin/", status_code=303)
+
+
+# ============================================================
+# PLAYGROUND ROUTES
+# ============================================================
+@app.get("/playground", response_class=HTMLResponse)
+async def playground(request: Request):
+    require_admin(request)
+    return HTMLResponse(playground_page(request.app.state.cxepy))
+
+
+@app.post("/pg/chat/completions")
+async def playground_chat(request: Request):
+    require_admin(request)
+    st: AppState = request.app.state.cxepy
+
+    form = await request.form()
+    model_id = (form.get("model") or "").strip()
+    messages_json = form.get("messages") or "[]"
+    stream = str(form.get("stream", "false")).lower() in ("true", "1", "on")
+
+    temperature = float(form.get("temperature") or 1.0)
+    top_p = float(form.get("top_p") or 1.0)
+    max_tokens = int(form.get("max_tokens") or 2048)
+
+    provider = next(
+        (p for p in st.providers.values() if p.model_id == model_id),
+        None
+    )
+    if not provider:
+        raise HTTPException(404, f"model {model_id!r} not configured")
+
+    try:
+        messages = json.loads(messages_json)
+    except Exception:
+        raise HTTPException(400, "invalid messages json")
+
+    # --- обработка файлов ---
+    uploads = form.getlist("files")
+    file_parts = []
+    for f in uploads:
+        if not isinstance(f, UploadFile):
+            continue
+        content = await f.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(413, f"file {f.filename} too large")
+        mime = f.content_type or mimetypes.guess_type(f.filename or "")[0] or ""
+        if mime in ALLOWED_IMAGE_TYPES:
+            b64 = base64.b64encode(content).decode()
+            file_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"}
+            })
+        else:
+            text = extract_text_from_file(content, mime, f.filename or "file")
+            file_parts.append({
+                "type": "text",
+                "text": f"\n\n[Файл: {f.filename}]\n{text}"
+            })
+
+    if file_parts and messages:
+        last = messages[-1]
+        if isinstance(last.get("content"), str):
+            parts = [{"type": "text", "text": last["content"]}] + file_parts
+            last["content"] = parts
+
+    payload = {
+        "model": provider.model_id,
+        "messages": messages,
+        "stream": stream,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+    }
+    if stream and INJECT_STREAM_USAGE:
+        payload["stream_options"] = {"include_usage": True}
+
+    body = json.dumps(payload).encode()
+    upstream_headers = {
+        "content-type": "application/json",
+        "accept": "text/event-stream" if stream else "application/json",
+    }
+
+    last_status, last_body = 0, b""
+    started = time.monotonic()
+
+    for attempt in range(MAX_KEY_ATTEMPTS):
+        key = await provider.pick()
+        if key is None:
+            if last_status:
+                break
+            raise HTTPException(503, "no available keys")
+
+        req = st.http.build_request(
+            "POST",
+            f"{provider.base_url}/v1/chat/completions",
+            headers={**upstream_headers, "authorization": f"Bearer {key.value}"},
+            content=body,
+        )
+        try:
+            resp = await st.http.send(req, stream=True)
+        except httpx.RequestError as e:
+            provider.release(key, 0)
+            last_status, last_body = 502, str(e).encode()
+            if attempt < MAX_KEY_ATTEMPTS - 1:
+                await asyncio.sleep(0.1 * (2 ** attempt))
+            continue
+
+        if resp.status_code >= 400:
+            err_body = await resp.aread()
+            await resp.aclose()
+            quota = _is_quota_error(resp.status_code, err_body)
+            provider.release(key, resp.status_code, is_quota=quota)
+            last_status, last_body = resp.status_code, err_body
+            if resp.status_code not in RETRYABLE_STATUS and not quota:
+                return JSONResponse(
+                    content=_safe_json(err_body),
+                    status_code=resp.status_code,
+                )
+            if attempt < MAX_KEY_ATTEMPTS - 1:
+                await asyncio.sleep(0.1 * (2 ** attempt))
+            continue
+
+        headers = {
+            k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP
+        }
+        return StreamingResponse(
+            _stream_upstream(resp, provider, key),
+            status_code=resp.status_code,
+            headers=headers,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+
+    return JSONResponse(content=_safe_json(last_body), status_code=last_status or 502)
 
 
 # ============================================================
@@ -1302,6 +2295,7 @@ async def chat_completions(request: Request):
     }
 
     last_status, last_body = 0, b""
+    client_prefix = raw[:14]
 
     for attempt in range(MAX_KEY_ATTEMPTS):
         key = await provider.pick()
@@ -1323,6 +2317,12 @@ async def chat_completions(request: Request):
             provider.release(key, 0)
             last_status, last_body = 502, str(e).encode()
             log.warning(f"upstream network error: {e}")
+            push_log(st, {
+                "provider": provider.name, "key_id": key.id,
+                "client_prefix": client_prefix, "status": 0,
+                "ms": int((time.monotonic() - started) * 1000),
+                "note": f"network: {e}",
+            })
             if attempt < MAX_KEY_ATTEMPTS - 1:
                 await asyncio.sleep(0.1 * (2 ** attempt))
             continue
@@ -1335,20 +2335,25 @@ async def chat_completions(request: Request):
             last_status, last_body = resp.status_code, err_body
 
             if resp.status_code not in RETRYABLE_STATUS and not quota:
-                log.info(
-                    f"proxy 4xx passthrough · prov={provider.name} key={key.id} "
-                    f"status={resp.status_code} "
-                    f"ms={int((time.monotonic()-started)*1000)}"
-                )
+                push_log(st, {
+                    "provider": provider.name, "key_id": key.id,
+                    "client_prefix": client_prefix,
+                    "status": resp.status_code,
+                    "ms": int((time.monotonic() - started) * 1000),
+                    "note": "passthrough",
+                })
                 return JSONResponse(
                     content=_safe_json(err_body),
                     status_code=resp.status_code,
                 )
 
-            log.info(
-                f"proxy retry · prov={provider.name} key={key.id} "
-                f"status={resp.status_code} quota={quota} attempt={attempt+1}"
-            )
+            push_log(st, {
+                "provider": provider.name, "key_id": key.id,
+                "client_prefix": client_prefix,
+                "status": resp.status_code,
+                "ms": int((time.monotonic() - started) * 1000),
+                "note": f"retry quota={quota}",
+            })
             if attempt < MAX_KEY_ATTEMPTS - 1:
                 await asyncio.sleep(0.1 * (2 ** attempt))
             continue
@@ -1356,10 +2361,13 @@ async def chat_completions(request: Request):
         headers = {
             k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP
         }
-        log.info(
-            f"proxy ok · prov={provider.name} key={key.id} "
-            f"status={resp.status_code} ms={int((time.monotonic()-started)*1000)}"
-        )
+        push_log(st, {
+            "provider": provider.name, "key_id": key.id,
+            "client_prefix": client_prefix,
+            "status": resp.status_code,
+            "ms": int((time.monotonic() - started) * 1000),
+            "note": "ok",
+        })
         return StreamingResponse(
             _stream_upstream(resp, provider, key),
             status_code=resp.status_code,
